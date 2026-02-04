@@ -404,14 +404,17 @@ class DhanAPI:
     async def place_order(self, security_id: str, transaction_type: str, qty: int, index_name: str = None) -> dict:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
+            default_segment = "NSE_FNO"
             exchange_segment = self.dhan.NSE_FNO
             if index_name:
                 try:
                     index_config = get_index_config(index_name)
-                    segment_key = (index_config.get("fno_segment") or "NSE_FNO").upper()
+                    segment_key = (index_config.get("fno_segment") or default_segment).upper()
+                    if not hasattr(self.dhan, segment_key):
+                        logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {default_segment}")
                     exchange_segment = getattr(self.dhan, segment_key, self.dhan.NSE_FNO)
                 except Exception as e:
-                    logger.warning(f"[ORDER] Falling back to NSE_FNO segment for {index_name}: {e}")
+                    logger.warning(f"[ORDER] Falling back to {default_segment} segment for {index_name}: {e}")
 
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
