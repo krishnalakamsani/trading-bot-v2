@@ -427,16 +427,10 @@ class DhanAPI:
                         if hasattr(self.dhan, segment_key):
                             exchange_segment = getattr(self.dhan, segment_key)
                         else:
+                            exchange_segment = self._default_exchange_segment
                             logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT}")
                 except Exception as e:
                     logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT} segment for {index_name}: {e}")
-
-            if exchange_segment is None:
-                return {
-                    "status": "error",
-                    "message": f"Dhan API missing exchange segment for {index_name or 'order'}",
-                    "orderId": None
-                }
 
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
