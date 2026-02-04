@@ -18,7 +18,7 @@ class DhanAPI:
         if self._default_exchange_segment is None:
             logger.error(
                 f"[ORDER] Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT_ATTR}. "
-                "Verify the Dhan SDK version and initialization."
+                "Verify the Dhan SDK version and initialization; order placement will fail."
             )
         # Cache for option chain to avoid rate limiting
         self._option_chain_cache = {}
@@ -433,7 +433,8 @@ class DhanAPI:
                         if resolved_segment is None:
                             resolved_segment = self._default_exchange_segment
                             logger.warning(
-                                f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT_ATTR}"
+                                f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT_ATTR} "
+                                "(may fail for BSE indices like SENSEX)"
                             )
                         exchange_segment = resolved_segment
                 except Exception as e:
