@@ -138,7 +138,7 @@ class TradingBot:
         else:
             if self.dhan:
                 security_id = self.current_position.get('security_id', '')
-                result = await self.dhan.place_order(security_id, "SELL", qty)
+                result = await self.dhan.place_order(security_id, "SELL", qty, index_name=index_name)
                 logger.info(f"[ORDER] Squareoff result: {result}")
                 if result.get('orderId') or result.get('status') == 'success':
                     exit_price = bot_state['current_option_ltp']
@@ -167,7 +167,7 @@ class TradingBot:
             
             try:
                 logger.info(f"[ORDER] Placing EXIT SELL order | Trade ID: {trade_id} | Security: {security_id} | Qty: {qty}")
-                result = await self.dhan.place_order(security_id, "SELL", qty)
+                result = await self.dhan.place_order(security_id, "SELL", qty, index_name=index_name)
                 
                 if result.get('status') == 'success' and result.get('orderId'):
                     order_id = result.get('orderId')
@@ -804,7 +804,7 @@ class TradingBot:
                 logger.error(f"[ERROR] Could not find security ID for {index_name} {strike} {option_type}")
                 return
             
-            result = await self.dhan.place_order(security_id, "BUY", qty)
+            result = await self.dhan.place_order(security_id, "BUY", qty, index_name=index_name)
             logger.info(f"[ORDER] Entry order result: {result}")
             
             # Check if order was successfully placed

@@ -401,13 +401,19 @@ class DhanAPI:
             logger.error(f"Error fetching option LTP: {e}")
         return 0
     
-    async def place_order(self, security_id: str, transaction_type: str, qty: int) -> dict:
+    async def place_order(self, security_id: str, transaction_type: str, qty: int, index_name: str = None) -> dict:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
+            exchange_segment = self.dhan.NSE_FNO
+            if index_name:
+                index_config = get_index_config(index_name)
+                segment_key = index_config.get("fno_segment", "NSE_FNO")
+                exchange_segment = getattr(self.dhan, segment_key, self.dhan.NSE_FNO)
+
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
                 security_id=security_id,
-                exchange_segment=self.dhan.NSE_FNO,
+                exchange_segment=exchange_segment,
                 transaction_type=self.dhan.BUY if transaction_type == "BUY" else self.dhan.SELL,
                 quantity=qty,
                 order_type=self.dhan.MARKET,
