@@ -6,18 +6,18 @@ from config import bot_state
 from indices import get_index_config
 
 logger = logging.getLogger(__name__)
-DEFAULT_FNO_SEGMENT = "NSE_FNO"
+DEFAULT_FNO_SEGMENT_ATTR = "NSE_FNO"
 
 class DhanAPI:
     def __init__(self, access_token: str, client_id: str):
         self.access_token = access_token
         self.client_id = client_id
         self.dhan = dhanhq(client_id, access_token)
-        self._default_exchange_segment = getattr(self.dhan, DEFAULT_FNO_SEGMENT, None)
+        self._default_exchange_segment = getattr(self.dhan, DEFAULT_FNO_SEGMENT_ATTR, None)
         self._segment_ready = self._default_exchange_segment is not None
         if self._default_exchange_segment is None:
             logger.error(
-                f"[ORDER] Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT}. "
+                f"[ORDER] Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT_ATTR}. "
                 "Verify the Dhan SDK version and initialization."
             )
         # Cache for option chain to avoid rate limiting
@@ -415,24 +415,29 @@ class DhanAPI:
             if not self._segment_ready:
                 return {
                     "status": "error",
-                    "message": f"Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT}",
+                    "message": f"Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT_ATTR}",
                     "orderId": None
                 }
             exchange_segment = self._default_exchange_segment
             if index_name:
                 try:
                     index_config = get_index_config(index_name)
+                    if not index_config:
+                        raise ValueError(f"Unknown index: {index_name}")
                     segment_key = index_config.get("fno_segment")
                     if segment_key:
+                        # Try exact attribute name first, then uppercase for config/SDK inconsistencies.
                         resolved_segment = getattr(self.dhan, segment_key, None)
                         if resolved_segment is None:
                             resolved_segment = getattr(self.dhan, segment_key.upper(), None)
                         if resolved_segment is None:
                             resolved_segment = self._default_exchange_segment
-                            logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT}")
+                            logger.warning(
+                                f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT_ATTR}"
+                            )
                         exchange_segment = resolved_segment
                 except Exception as e:
-                    logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT} segment for {index_name}: {e}")
+                    logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT_ATTR} segment for {index_name}: {e}")
 
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
