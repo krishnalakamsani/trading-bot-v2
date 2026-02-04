@@ -406,7 +406,9 @@ class DhanAPI:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
             default_segment = DEFAULT_FNO_SEGMENT
-            exchange_segment = getattr(self.dhan, default_segment)
+            exchange_segment = getattr(self.dhan, default_segment, None)
+            if exchange_segment is None:
+                raise AttributeError(f"Dhan API missing segment attribute: {default_segment}")
             if index_name:
                 try:
                     index_config = get_index_config(index_name)
