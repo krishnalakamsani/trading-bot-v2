@@ -411,12 +411,11 @@ class DhanAPI:
     async def place_order(self, security_id: str, transaction_type: str, qty: int, index_name: str = None) -> dict:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
-            default_segment = DEFAULT_FNO_SEGMENT
             exchange_segment = self._default_exchange_segment
             if exchange_segment is None:
                 return {
                     "status": "error",
-                    "message": f"Dhan API missing segment attribute: {default_segment}",
+                    "message": f"Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT}",
                     "orderId": None
                 }
             if index_name:
@@ -428,9 +427,16 @@ class DhanAPI:
                         if hasattr(self.dhan, segment_key):
                             exchange_segment = getattr(self.dhan, segment_key)
                         else:
-                            logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {default_segment}")
+                            logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT}")
                 except Exception as e:
-                    logger.warning(f"[ORDER] Falling back to {default_segment} segment for {index_name}: {e}")
+                    logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT} segment for {index_name}: {e}")
+
+            if exchange_segment is None:
+                return {
+                    "status": "error",
+                    "message": f"Dhan API missing exchange segment for {index_name or 'order'}",
+                    "orderId": None
+                }
 
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
