@@ -13,6 +13,12 @@ class DhanAPI:
         self.access_token = access_token
         self.client_id = client_id
         self.dhan = dhanhq(client_id, access_token)
+        self._default_exchange_segment = getattr(self.dhan, DEFAULT_FNO_SEGMENT, None)
+        if self._default_exchange_segment is None:
+            logger.error(
+                f"[ORDER] Dhan API missing segment attribute: {DEFAULT_FNO_SEGMENT}. "
+                "Verify the Dhan SDK version and initialization."
+            )
         # Cache for option chain to avoid rate limiting
         self._option_chain_cache = {}
         self._option_chain_cache_time = {}
@@ -406,20 +412,23 @@ class DhanAPI:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
             default_segment = DEFAULT_FNO_SEGMENT
-            exchange_segment = getattr(self.dhan, default_segment, None)
+            exchange_segment = self._default_exchange_segment
             if exchange_segment is None:
-                raise AttributeError(
-                    f"Dhan API missing segment attribute: {default_segment}. "
-                    "Verify the Dhan SDK version and initialization."
-                )
+                return {
+                    "status": "error",
+                    "message": f"Dhan API missing segment attribute: {default_segment}",
+                    "orderId": None
+                }
             if index_name:
                 try:
                     index_config = get_index_config(index_name)
-                    segment_key = (index_config.get("fno_segment") or default_segment).upper()
-                    if hasattr(self.dhan, segment_key):
-                        exchange_segment = getattr(self.dhan, segment_key)
-                    else:
-                        logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {default_segment}")
+                    segment_key = index_config.get("fno_segment")
+                    if segment_key:
+                        segment_key = segment_key.upper()
+                        if hasattr(self.dhan, segment_key):
+                            exchange_segment = getattr(self.dhan, segment_key)
+                        else:
+                            logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {default_segment}")
                 except Exception as e:
                     logger.warning(f"[ORDER] Falling back to {default_segment} segment for {index_name}: {e}")
 
