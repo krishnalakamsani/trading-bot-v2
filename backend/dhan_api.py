@@ -424,14 +424,13 @@ class DhanAPI:
                     index_config = get_index_config(index_name)
                     segment_key = index_config.get("fno_segment")
                     if segment_key:
-                        segment_key = str(segment_key)
-                        if hasattr(self.dhan, segment_key):
-                            exchange_segment = getattr(self.dhan, segment_key)
-                        elif hasattr(self.dhan, segment_key.upper()):
-                            exchange_segment = getattr(self.dhan, segment_key.upper())
-                        else:
-                            exchange_segment = self._default_exchange_segment
+                        resolved_segment = getattr(self.dhan, segment_key, None)
+                        if resolved_segment is None:
+                            resolved_segment = getattr(self.dhan, segment_key.upper(), None)
+                        if resolved_segment is None:
+                            resolved_segment = self._default_exchange_segment
                             logger.warning(f"[ORDER] Unknown segment '{segment_key}' for {index_name}; using {DEFAULT_FNO_SEGMENT}")
+                        exchange_segment = resolved_segment
                 except Exception as e:
                     logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT} segment for {index_name}: {e}")
 
