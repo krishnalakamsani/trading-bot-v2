@@ -406,9 +406,12 @@ class DhanAPI:
         try:
             exchange_segment = self.dhan.NSE_FNO
             if index_name:
-                index_config = get_index_config(index_name)
-                segment_key = index_config.get("fno_segment", "NSE_FNO")
-                exchange_segment = getattr(self.dhan, segment_key, self.dhan.NSE_FNO)
+                try:
+                    index_config = get_index_config(index_name)
+                    segment_key = (index_config.get("fno_segment") or "NSE_FNO").upper()
+                    exchange_segment = getattr(self.dhan, segment_key, self.dhan.NSE_FNO)
+                except Exception as e:
+                    logger.warning(f"[ORDER] Falling back to NSE_FNO segment for {index_name}: {e}")
 
             # Dhan API is synchronous, call it directly
             response = self.dhan.place_order(
