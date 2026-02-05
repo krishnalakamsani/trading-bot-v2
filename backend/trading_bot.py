@@ -615,10 +615,16 @@ class TradingBot:
         if profit_points < trail_start:
             return
         
-        # Calculate trailing SL level: Entry + (steps × trail_step)
-        # Steps = (highest_profit - trail_start) / trail_step
+        # Trailing behavior:
+        # - Start trailing only after profit reaches trail_start
+        # - Once active, SL trails behind highest profit by trail_step in step increments
+        # Example: entry=100, start=10, step=5
+        #   at profit=10 (LTP=110) -> SL locks +5 (105)
+        #   at profit=15 (LTP=115) -> SL locks +10 (110)
         trail_levels = int((self.highest_profit - trail_start) / trail_step)
-        new_sl = self.entry_price + (trail_levels * trail_step)
+        locked_profit = (trail_start - trail_step) + (trail_levels * trail_step)
+        locked_profit = max(0.0, locked_profit)
+        new_sl = self.entry_price + locked_profit
         
         # Always move SL up, never down (protect profit)
         if self.trailing_sl is None or new_sl > self.trailing_sl:
