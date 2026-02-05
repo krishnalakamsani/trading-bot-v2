@@ -55,7 +55,7 @@ config = {
     "selected_index": "NIFTY",  # Default index
     # Trade protection settings
     "min_trade_gap": 0,  # Minimum seconds between trades (0 = disabled)
-    "trade_only_on_flip": False,  # Only trade on SuperTrend direction change
+    "trade_only_on_flip": True,  # Only trade on SuperTrend direction change
     "risk_per_trade": 0,  # Risk amount per trade (0 = disabled, uses fixed qty)
 
     # Multi-timeframe (MTF) filter

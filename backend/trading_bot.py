@@ -486,6 +486,8 @@ class TradingBot:
                             )
                         
                         if signal:
+                            prev_signal = bot_state.get('last_supertrend_signal')
+                            flipped = prev_signal is None or signal != prev_signal
                             bot_state['last_supertrend_signal'] = signal
                             
                             # Check trailing SL/Target on candle close ONLY
@@ -504,7 +506,7 @@ class TradingBot:
                                     can_trade = False
                             
                             if can_trade:
-                                exited = await self.process_signal_on_close(signal, close)
+                                exited = await self.process_signal_on_close(signal, close, flipped=flipped)
                                 if exited:
                                     self.last_exit_candle_time = current_candle_time
                     
@@ -721,7 +723,7 @@ class TradingBot:
         
         return False
     
-    async def process_signal_on_close(self, signal: str, index_ltp: float) -> bool:
+    async def process_signal_on_close(self, signal: str, index_ltp: float, flipped: bool = False) -> bool:
         """Process SuperTrend signal on candle close"""
         exited = False
         index_name = config['selected_index']
@@ -792,6 +794,11 @@ class TradingBot:
             logger.debug("[SIGNAL] No signal generated, skipping entry")
             return exited
 
+        # Trade only on SuperTrend FLIP (candle-to-candle), not based on previous trade state
+        if config.get('trade_only_on_flip', False) and not flipped:
+            logger.info(f"[ENTRY] ✗ Skipping - No SuperTrend flip this candle | Signal={signal}")
+            return exited
+
         # MTF FILTER: If trading below 1m, only take entries aligned with 1m SuperTrend direction
         if config.get('htf_filter_enabled', True) and config.get('candle_interval', 60) < 60:
             htf_direction = getattr(self.htf_indicator, 'direction', 0) if self.htf_indicator else 0
@@ -806,12 +813,8 @@ class TradingBot:
                 logger.info(f"[ENTRY] ✗ Skipping - HTF filter mismatch | LTF={signal}, HTF={htf_side}")
                 return exited
         
-        # CRITICAL: Require signal FLIP before re-entering
-        # After any exit (reversal or forced square-off), wait for opposite signal
-        if config.get('trade_only_on_flip', False):
-            if self.last_signal and signal == self.last_signal:
-                logger.info(f"[ENTRY] ✗ Skipping - Waiting for signal flip | Current={signal}, Last={self.last_signal}")
-                return exited
+        # NOTE: Previously we compared against last trade signal (self.last_signal).
+        # That behavior is replaced by candle-level flip detection via the `flipped` flag.
         
         option_type = 'PE' if signal == 'RED' else 'CE'
         atm_strike = round_to_strike(index_ltp, index_name)

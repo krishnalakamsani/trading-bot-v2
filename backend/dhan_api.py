@@ -109,6 +109,57 @@ class DhanAPI:
 
         return None, None
 
+    def _match_nearest_strike_node(self, oc_data: object, strike: int, max_diff: float) -> tuple:
+        """Return the nearest (matched_key, strike_node_dict) within max_diff.
+
+        This is used as a fallback when the exact strike key is not present in the option chain,
+        which can happen when strike intervals differ (e.g., SENSEX) or when the chain omits
+        certain strikes.
+        """
+        if not oc_data:
+            return None, None
+
+        best_key = None
+        best_node = None
+        best_diff = None
+
+        if isinstance(oc_data, dict):
+            for key, node in oc_data.items():
+                if not isinstance(node, dict) or not node:
+                    continue
+                try:
+                    numeric_key = float(str(key))
+                except Exception:
+                    continue
+                diff = abs(numeric_key - float(strike))
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_key = key
+                    best_node = node
+
+        elif isinstance(oc_data, list):
+            for entry in oc_data:
+                if not isinstance(entry, dict):
+                    continue
+                sp = entry.get('strike_price')
+                if sp is None:
+                    sp = entry.get('strikePrice')
+                if sp is None:
+                    sp = entry.get('strike')
+                try:
+                    numeric_sp = float(sp)
+                except Exception:
+                    continue
+                diff = abs(numeric_sp - float(strike))
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_key = str(sp)
+                    best_node = entry
+
+        if best_diff is not None and best_diff <= float(max_diff):
+            return str(best_key), best_node
+        return None, None
+
     def _extract_security_id(self, opt_data: object) -> str:
         """Extract security id from option payload across possible key names."""
         if not isinstance(opt_data, dict):
@@ -311,6 +362,12 @@ class DhanAPI:
             if not expiry:
                 expiry = await self.get_nearest_expiry(index_name)
 
+            index_config = get_index_config(index_name)
+            strike_interval = float(index_config.get('strike_interval', 0) or 0)
+            # Fallback tolerance for nearest strike matching (helps SENSEX/BSE chains).
+            # Allow up to 1 interval difference; if interval is unknown, allow 100.
+            nearest_max_diff = strike_interval if strike_interval > 0 else 100.0
+
             # Dhan option-chain can intermittently return partial/empty oc payload.
             # Retry once with force_refresh to avoid cache + transient API hiccups.
             import asyncio
@@ -332,9 +389,21 @@ class DhanAPI:
                     break
 
                 matched_key, strike_node = self._match_strike_node(oc_data, strike)
+                if not strike_node:
+                    matched_key, strike_node = self._match_nearest_strike_node(oc_data, strike, max_diff=nearest_max_diff)
                 if isinstance(strike_node, dict) and strike_node:
-                    opt_key = 'ce' if option_type.upper() == 'CE' else 'pe'
-                    opt_data = strike_node.get(opt_key, {})
+                    # Dhan payload keys can vary in case; try a small set of common keys.
+                    if option_type.upper() == 'CE':
+                        opt_candidates = ['ce', 'CE', 'call', 'CALL']
+                    else:
+                        opt_candidates = ['pe', 'PE', 'put', 'PUT']
+
+                    opt_data = {}
+                    for k in opt_candidates:
+                        if isinstance(strike_node.get(k), dict) and strike_node.get(k):
+                            opt_data = strike_node.get(k)
+                            break
+
                     security_id = self._extract_security_id(opt_data)
                     if security_id:
                         logger.info(
@@ -360,7 +429,10 @@ class DhanAPI:
                     f"Strike {strike} not found in option chain for {index_name} expiry={expiry} after retry. Sample strikes: {available_strikes}"
                 )
             
-            logger.warning(f"Could not find security ID for {index_name} {strike} {option_type}")
+            logger.warning(
+                f"Could not find security ID for {index_name} {strike} {option_type}. "
+                "This usually means the option chain does not contain that strike/side or the underlying security_id/segment is incorrect."
+            )
         except Exception as e:
             logger.error(f"Error getting ATM option security ID: {e}")
         return ""
