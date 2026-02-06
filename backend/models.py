@@ -30,6 +30,18 @@ class ConfigUpdate(BaseModel):
     # Order pacing
     min_order_cooldown_seconds: Optional[int] = None  # Minimum seconds between any two orders
 
+    # Testing
+    bypass_market_hours: Optional[bool] = None  # If True: ignore market-hours gating (paper testing)
+
+    # Indicator / strategy
+    indicator_type: Optional[str] = None  # supertrend | supertrend_macd
+    supertrend_period: Optional[int] = None
+    supertrend_multiplier: Optional[float] = None
+    macd_fast: Optional[int] = None
+    macd_slow: Optional[int] = None
+    macd_signal: Optional[int] = None
+    macd_confirmation_enabled: Optional[bool] = None
+
 class BotStatus(BaseModel):
     is_running: bool
     mode: str

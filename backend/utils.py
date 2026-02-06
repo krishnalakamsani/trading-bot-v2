@@ -9,6 +9,13 @@ def get_ist_time():
 
 def is_market_open():
     """Check if market is open (9:15 AM - 3:30 PM IST, Monday-Friday)"""
+    try:
+        from config import config as _config
+        if _config.get('bypass_market_hours', False):
+            return True
+    except Exception:
+        pass
+
     ist = get_ist_time()
     
     # Check if it's a weekday (Monday=0 to Friday=4, Saturday=5, Sunday=6)
@@ -21,6 +28,13 @@ def is_market_open():
 
 def can_take_new_trade():
     """Check if new trades are allowed (before 3:10 PM IST, weekday only)"""
+    try:
+        from config import config as _config
+        if _config.get('bypass_market_hours', False):
+            return True
+    except Exception:
+        pass
+
     ist = get_ist_time()
     
     # Check if it's a weekday
@@ -32,6 +46,13 @@ def can_take_new_trade():
 
 def should_force_squareoff():
     """Check if it's time to force square off (3:25 PM IST, weekday only)"""
+    try:
+        from config import config as _config
+        if _config.get('bypass_market_hours', False):
+            return False
+    except Exception:
+        pass
+
     ist = get_ist_time()
     
     # Check if it's a weekday

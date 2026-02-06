@@ -30,6 +30,7 @@ class TradingBot:
         self.highest_profit = 0.0
         self.indicator = None  # Will hold selected indicator
         self.htf_indicator = None  # Higher-timeframe SuperTrend (e.g., 1m filter)
+        self.macd = None  # LTF MACD for confirmation
         self.last_exit_candle_time = None
         self.last_trade_time = None  # For min_trade_gap protection
         self.last_signal = None  # For trade_only_on_flip protection
@@ -69,7 +70,7 @@ class TradingBot:
         return False
     
     def _initialize_indicator(self):
-        """Initialize SuperTrend indicator"""
+        """Initialize indicators (SuperTrend + optional MACD confirmation)"""
         try:
             self.indicator = SuperTrend(
                 period=config['supertrend_period'],
@@ -80,12 +81,19 @@ class TradingBot:
                 period=config['supertrend_period'],
                 multiplier=config['supertrend_multiplier']
             )
+            # MACD used for entry confirmation (if enabled)
+            self.macd = MACD(
+                fast=int(config.get('macd_fast', 12)),
+                slow=int(config.get('macd_slow', 26)),
+                signal=int(config.get('macd_signal', 9)),
+            )
             logger.info(f"[SIGNAL] SuperTrend initialized")
         except Exception as e:
             logger.error(f"[ERROR] Failed to initialize indicator: {e}")
             # Fallback to SuperTrend
             self.indicator = SuperTrend(period=7, multiplier=4)
             self.htf_indicator = SuperTrend(period=7, multiplier=4)
+            self.macd = MACD(fast=12, slow=26, signal=9)
             logger.info(f"[SIGNAL] SuperTrend (fallback) initialized")
     
     def reset_indicator(self):
@@ -94,6 +102,8 @@ class TradingBot:
             self.indicator.reset()
         if self.htf_indicator:
             self.htf_indicator.reset()
+        if self.macd:
+            self.macd.reset()
             logger.info(f"[SIGNAL] Indicator reset: {config.get('indicator_type', 'supertrend')}")
     
     def is_within_trading_hours(self) -> bool:
@@ -279,6 +289,7 @@ class TradingBot:
         self.highest_profit = 0
         self.entry_time_utc = None
         
+        self.macd = None  # MACD used for confirmation
         logger.info(f"[EXIT] ✓ Position closed | {index_name} {option_type} {strike} | Reason: {reason} | PnL: {pnl:.2f} | Order Placed: {exit_order_placed}")
     
     async def run_loop(self):
@@ -350,24 +361,25 @@ class TradingBot:
                         if index_ltp > 0:
                             bot_state['index_ltp'] = index_ltp
                 
-                # If no data from API (market closed or no credentials), simulate index movement for testing
-                if bot_state['index_ltp'] == 0 and config.get('bypass_market_hours', False):
-                    # Initialize with realistic base value for index
-                    index_config = get_index_config(index_name)
+                # Paper testing: simulate index movement when bypass_market_hours is enabled.
+                # This keeps candles moving even if the API returns stale/flat prices outside market hours.
+                if bot_state.get('mode') == 'paper' and config.get('bypass_market_hours', False):
                     if bot_state.get('simulated_base_price') is None:
-                        if index_name == 'NIFTY':
-                            bot_state['simulated_base_price'] = 23500.0
-                        elif index_name == 'BANKNIFTY':
-                            bot_state['simulated_base_price'] = 51500.0
-                        elif index_name == 'FINNIFTY':
-                            bot_state['simulated_base_price'] = 22000.0
-                        elif index_name == 'MIDCPNIFTY':
-                            bot_state['simulated_base_price'] = 12500.0
+                        # Prefer any existing index_ltp as starting point; else fall back to a realistic base.
+                        if bot_state.get('index_ltp', 0) > 0:
+                            bot_state['simulated_base_price'] = float(bot_state['index_ltp'])
                         else:
-                            bot_state['simulated_base_price'] = 70000.0  # SENSEX
-                    
-                    # Generate realistic tick movements (simulate market volatility)
-                    base = bot_state['simulated_base_price']
+                            if index_name == 'NIFTY':
+                                bot_state['simulated_base_price'] = 23500.0
+                            elif index_name == 'BANKNIFTY':
+                                bot_state['simulated_base_price'] = 51500.0
+                            elif index_name == 'FINNIFTY':
+                                bot_state['simulated_base_price'] = 22000.0
+                            elif index_name == 'MIDCPNIFTY':
+                                bot_state['simulated_base_price'] = 12500.0
+                            else:
+                                bot_state['simulated_base_price'] = 70000.0  # SENSEX
+
                     tick_change = random.choice([-15, -10, -5, -2, 0, 2, 5, 10, 15])
                     bot_state['simulated_base_price'] += tick_change
                     bot_state['index_ltp'] = round(bot_state['simulated_base_price'], 2)
@@ -445,12 +457,16 @@ class TradingBot:
                     
                     if high > 0 and low < float('inf'):
                         indicator_value, signal = self.indicator.add_candle(high, low, close)
-                        macd_value = 0.0  # MACD not used in SuperTrend-only mode
+                        macd_value = 0.0
+                        if self.macd:
+                            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
+                            if macd_line is not None:
+                                macd_value = float(macd_line)
                         
                         # Always update SuperTrend value
                         if indicator_value:
                             bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
-                            bot_state['macd_value'] = 0.0  # MACD not used in SuperTrend-only mode
+                            bot_state['macd_value'] = macd_value
                             
                             # Update signal status (GREEN="buy", RED="sell", None="waiting")
                             if signal == "GREEN":
@@ -468,7 +484,7 @@ class TradingBot:
                             logger.info(
                                 f"[CANDLE CLOSE #{candle_number}] {index_name} | "
                                 f"H={high:.2f} L={low:.2f} C={close:.2f} | "
-                                f"ST={indicator_value:.2f} | "
+                                f"ST={indicator_value:.2f} | MACD={macd_value:.4f} | "
                                 f"{signal_status}"
                             )
                             
@@ -798,6 +814,28 @@ class TradingBot:
         if config.get('trade_only_on_flip', False) and not flipped:
             logger.info(f"[ENTRY] ✗ Skipping - No SuperTrend flip this candle | Signal={signal}")
             return exited
+
+        # MACD CONFIRMATION: require MACD line to confirm direction at candle close
+        if config.get('macd_confirmation_enabled', True):
+            if not self.macd or self.macd.last_macd is None or self.macd.last_signal_line is None:
+                logger.info("[ENTRY] ✗ Skipping - MACD not ready yet")
+                return exited
+
+            eps = 1e-9
+            diff = float(self.macd.last_macd) - float(self.macd.last_signal_line)
+            bullish = diff >= -eps
+            if signal == 'GREEN' and not bullish:
+                logger.info(
+                    f"[ENTRY] ✗ Skipping - MACD not confirming BUY | "
+                    f"MACD={self.macd.last_macd:.4f} SIG={self.macd.last_signal_line:.4f}"
+                )
+                return exited
+            if signal == 'RED' and bullish:
+                logger.info(
+                    f"[ENTRY] ✗ Skipping - MACD not confirming SELL | "
+                    f"MACD={self.macd.last_macd:.4f} SIG={self.macd.last_signal_line:.4f}"
+                )
+                return exited
 
         # MTF FILTER: If trading below 1m, only take entries aligned with 1m SuperTrend direction
         if config.get('htf_filter_enabled', True) and config.get('candle_interval', 60) < 60:

@@ -1,7 +1,11 @@
 # Configuration and state management
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -48,9 +52,17 @@ config = {
     "trail_step": 0,  # Trailing step size (0 = disabled)
     # Profit Taking
     "target_points": 0,  # Target profit points (0 = disabled)
-    # Signal & Indicator Settings (SuperTrend only)
+
+    # Testing
+    "bypass_market_hours": False,  # If True: allow running logic outside 9:15-15:30 IST
+    # Signal & Indicator Settings
+    "indicator_type": "supertrend_macd",  # supertrend | supertrend_macd
     "supertrend_period": 7,
     "supertrend_multiplier": 4,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "macd_confirmation_enabled": True,
     "candle_interval": 5,  # seconds (default 5s)
     "selected_index": "NIFTY",  # Default index
     # Trade protection settings

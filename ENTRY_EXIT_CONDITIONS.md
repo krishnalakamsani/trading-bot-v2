@@ -13,11 +13,16 @@
    - ✅ GREEN signal → Buy CE (Call)
    - ✅ RED signal → Buy PE (Put)
 
-3. **Strike Selection**
+3. **MACD Confirmation (If Enabled)**
+  - ✅ For GREEN entries: MACD line must be **above** MACD signal line on candle close
+  - ✅ For RED entries: MACD line must be **below** MACD signal line on candle close
+  - If MACD is not warmed up yet (not enough candles), entry is skipped until ready
+
+4. **Strike Selection**
    - Current Index LTP → Find ATM (At The Money) strike
    - Round to nearest strike interval (NIFTY: 50 pts, BANKNIFTY: 100 pts)
 
-4. **Entry Price**
+5. **Entry Price**
    - Get real LTP from Dhan API (or simulated in PAPER mode)
    - Round to nearest 0.05 (tick size)
 

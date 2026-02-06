@@ -155,57 +155,96 @@ class MACD:
         self.signal_period = signal
         self.closes = []
         self.macd_values = []
+
+        # Latest computed values (for entry confirmation & telemetry)
+        self.last_macd = None
+        self.last_signal_line = None
+        self.last_histogram = None
+        self.last_cross = None
+
+        self._fast_ema = None
+        self._slow_ema = None
+        self._signal_ema = None
+
+        self._fast_seed = []
+        self._slow_seed = []
+        self._signal_seed = []
+
+        self._last_relation = None  # 1 bullish (macd>=signal), -1 bearish
     
     def reset(self):
         self.closes = []
         self.macd_values = []
+
+        self.last_macd = None
+        self.last_signal_line = None
+        self.last_histogram = None
+        self.last_cross = None
+
+        self._fast_ema = None
+        self._slow_ema = None
+        self._signal_ema = None
+
+        self._fast_seed = []
+        self._slow_seed = []
+        self._signal_seed = []
+
+        self._last_relation = None
     
-    def _ema(self, values, period):
-        """Calculate Exponential Moving Average"""
-        if len(values) < period:
+    def _update_ema(self, current_ema, value, period, seed_list):
+        """Incremental EMA update with SMA seeding."""
+        if period <= 0:
             return None
-        
-        if len(values) == period:
-            return sum(values[-period:]) / period
-        
+
         alpha = 2 / (period + 1)
-        ema = sum(values[-period:]) / period
-        for val in values[-len(values)+period:]:
-            ema = val * alpha + ema * (1 - alpha)
-        return ema
+        if current_ema is None:
+            seed_list.append(value)
+            if len(seed_list) < period:
+                return None
+            if len(seed_list) == period:
+                return sum(seed_list) / period
+            # Should not normally exceed, but keep stable if it does
+            return sum(seed_list[-period:]) / period
+        return value * alpha + current_ema * (1 - alpha)
     
     def add_candle(self, high, low, close):
         """Add candle and calculate MACD"""
         self.closes.append(close)
-        
-        if len(self.closes) < self.slow + self.signal_period:
+
+        # Update fast/slow EMAs
+        self._fast_ema = self._update_ema(self._fast_ema, close, self.fast, self._fast_seed)
+        self._slow_ema = self._update_ema(self._slow_ema, close, self.slow, self._slow_seed)
+
+        if self._fast_ema is None or self._slow_ema is None:
+            self.last_macd = None
+            self.last_signal_line = None
+            self.last_histogram = None
+            self.last_cross = None
             return None, None
-        
-        # Calculate EMAs
-        fast_ema = self._ema(self.closes, self.fast)
-        slow_ema = self._ema(self.closes, self.slow)
-        
-        if fast_ema is None or slow_ema is None:
-            return None, None
-        
-        macd = fast_ema - slow_ema
-        signal_line = self._ema([self._ema(self.closes[:i], self.fast) - self._ema(self.closes[:i], self.slow) 
-                                 for i in range(self.slow, len(self.closes) + 1)], self.signal_period)
-        
+
+        macd = self._fast_ema - self._slow_ema
         self.macd_values.append(macd)
-        
-        # Signal: GREEN if MACD crosses above signal line, RED if below
-        if len(self.macd_values) > 1:
-            if self.macd_values[-2] < signal_line and macd > signal_line:
-                signal = "GREEN"
-            elif self.macd_values[-2] > signal_line and macd < signal_line:
-                signal = "RED"
-            else:
-                signal = None
-        else:
-            signal = None
-        
-        return macd, signal
+
+        # Update signal line EMA over MACD values
+        self._signal_ema = self._update_ema(self._signal_ema, macd, self.signal_period, self._signal_seed)
+
+        cross = None
+        histogram = None
+        relation = None
+
+        if self._signal_ema is not None:
+            histogram = macd - self._signal_ema
+            relation = 1 if macd >= self._signal_ema else -1
+            if self._last_relation is not None and relation != self._last_relation:
+                cross = "GREEN" if relation == 1 else "RED"
+            self._last_relation = relation
+
+        self.last_macd = macd
+        self.last_signal_line = self._signal_ema
+        self.last_histogram = histogram
+        self.last_cross = cross
+
+        return macd, cross
 
 
 class MovingAverage:

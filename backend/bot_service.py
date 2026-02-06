@@ -146,9 +146,17 @@ def get_config() -> dict:
         "trail_step": config['trail_step'],
         "target_points": config['target_points'],
         "risk_per_trade": config.get('risk_per_trade', 0),
-        # Indicator Settings (SuperTrend only)
+        # Indicator / Strategy Settings
+        "indicator_type": config.get('indicator_type', 'supertrend'),
         "supertrend_period": config.get('supertrend_period', 7),
         "supertrend_multiplier": config.get('supertrend_multiplier', 4),
+        "macd_fast": int(config.get('macd_fast', 12)),
+        "macd_slow": int(config.get('macd_slow', 26)),
+        "macd_signal": int(config.get('macd_signal', 9)),
+        "macd_confirmation_enabled": bool(config.get('macd_confirmation_enabled', True)),
+
+        # Testing
+        "bypass_market_hours": bool(config.get('bypass_market_hours', False)),
 
         # MTF filter
         "htf_filter_enabled": bool(config.get('htf_filter_enabled', True)),
@@ -255,6 +263,11 @@ async def update_config_values(updates: dict) -> dict:
         config['min_order_cooldown_seconds'] = cooldown
         updated_fields.append('min_order_cooldown_seconds')
         logger.info(f"[CONFIG] Min order cooldown set to: {config['min_order_cooldown_seconds']}s")
+
+    if updates.get('bypass_market_hours') is not None:
+        config['bypass_market_hours'] = str(updates['bypass_market_hours']).lower() in ('true', '1', 'yes')
+        updated_fields.append('bypass_market_hours')
+        logger.warning(f"[CONFIG] Bypass market hours: {config['bypass_market_hours']}")
         
     if updates.get('selected_index') is not None:
         new_index = updates['selected_index'].upper()
@@ -282,15 +295,20 @@ async def update_config_values(updates: dict) -> dict:
     
     if updates.get('indicator_type') is not None:
         new_indicator = updates['indicator_type'].lower()
-        if new_indicator == 'supertrend_macd':
+        if new_indicator in ('supertrend', 'supertrend_macd'):
             config['indicator_type'] = new_indicator
             updated_fields.append('indicator_type')
-            logger.info(f"[CONFIG] Indicator changed to: SuperTrend + MACD")
-            # Initialize the new indicator
+            logger.info(f"[CONFIG] Indicator changed to: {new_indicator}")
+            # Re-initialize indicators
             bot = get_trading_bot()
             bot._initialize_indicator()
         else:
-            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Only 'supertrend_macd' is supported")
+            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd'")
+
+    if updates.get('macd_confirmation_enabled') is not None:
+        config['macd_confirmation_enabled'] = str(updates['macd_confirmation_enabled']).lower() in ('true', '1', 'yes')
+        updated_fields.append('macd_confirmation_enabled')
+        logger.info(f"[CONFIG] MACD confirmation enabled: {config['macd_confirmation_enabled']}")
     
     # Update indicator parameters if provided
     indicator_params = {

@@ -82,13 +82,13 @@ async def load_config():
                 for key, value in rows:
                     if key in config:
                         # Integer fields
-                        if key in ['order_qty', 'max_trades_per_day', 'candle_interval', 'supertrend_period', 'min_trade_gap', 'htf_filter_timeframe', 'min_hold_seconds', 'min_order_cooldown_seconds']:
+                        if key in ['order_qty', 'max_trades_per_day', 'candle_interval', 'supertrend_period', 'min_trade_gap', 'htf_filter_timeframe', 'min_hold_seconds', 'min_order_cooldown_seconds', 'macd_fast', 'macd_slow', 'macd_signal']:
                             config[key] = int(value)
                         # Float fields
                         elif key in ['daily_max_loss', 'initial_stoploss', 'max_loss_per_trade', 'trail_start_profit', 'trail_step', 'target_points', 'risk_per_trade', 'supertrend_multiplier']:
                             config[key] = float(value)
                         # Boolean fields
-                        elif key in ['trade_only_on_flip', 'trading_enabled', 'htf_filter_enabled']:
+                        elif key in ['trade_only_on_flip', 'trading_enabled', 'htf_filter_enabled', 'macd_confirmation_enabled', 'bypass_market_hours']:
                             config[key] = value.lower() in ('true', '1', 'yes')
                         else:
                             config[key] = value
@@ -111,7 +111,6 @@ async def save_config():
 async def save_trade(trade_data: dict):
     """Save trade to database"""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute('''
                 INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
