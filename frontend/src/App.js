@@ -62,6 +62,28 @@ function App() {
     trail_step: 5,
     target_points: 0,
     risk_per_trade: 0,
+
+    // Strategy / indicators
+    indicator_type: "supertrend_macd",
+    supertrend_period: 7,
+    supertrend_multiplier: 4,
+    macd_fast: 12,
+    macd_slow: 26,
+    macd_signal: 9,
+    macd_confirmation_enabled: true,
+
+    // Trade protections
+    min_trade_gap: 0,
+    trade_only_on_flip: true,
+
+    // Multi-timeframe filter
+    htf_filter_enabled: true,
+    htf_filter_timeframe: 60,
+
+    // Exit / order pacing
+    min_hold_seconds: 15,
+    min_order_cooldown_seconds: 15,
+
     has_credentials: false,
     mode: "paper",
     selected_index: "NIFTY",
@@ -70,7 +92,10 @@ function App() {
     strike_interval: 50,
 
     // Trading control
-    trading_enabled: true
+    trading_enabled: true,
+
+    // Testing
+    bypass_market_hours: false
   });
   const [indices, setIndices] = useState([]);
   const [timeframes, setTimeframes] = useState([]);
@@ -152,13 +177,15 @@ function App() {
               total_pnl: update.daily_pnl
             }));
             if (update.position) {
+              const qty = update.position.qty ?? (currentConfig.order_qty * currentConfig.lot_size);
               setPosition({
                 has_position: true,
                 ...update.position,
                 entry_price: update.entry_price,
                 current_ltp: update.current_option_ltp,
                 trailing_sl: update.trailing_sl,
-                unrealized_pnl: (update.current_option_ltp - update.entry_price) * currentConfig.order_qty * currentConfig.lot_size
+                qty,
+                unrealized_pnl: (update.current_option_ltp - update.entry_price) * qty
               });
             } else {
               setPosition({ has_position: false });

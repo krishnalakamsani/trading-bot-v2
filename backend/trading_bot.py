@@ -112,6 +112,9 @@ class TradingBot:
         Returns:
             bool: True if within allowed trading hours, False otherwise
         """
+        if config.get('bypass_market_hours', False):
+            return True
+
         ist = get_ist_time()
         current_time = ist.time()
         
@@ -167,74 +170,84 @@ class TradingBot:
             return {"status": "error", "message": "No open position"}
         
         index_name = config['selected_index']
-        index_config = get_index_config(index_name)
-        qty = config['order_qty'] * index_config['lot_size']
+        qty = int(self.current_position.get('qty') or 0)
+        if qty <= 0:
+            index_config = get_index_config(index_name)
+            qty = config['order_qty'] * index_config['lot_size']
         
         logger.info(f"[ORDER] Force squareoff initiated for {index_name}")
         
-        if bot_state['mode'] == 'paper':
-            exit_price = bot_state['current_option_ltp']
-            pnl = (exit_price - self.entry_price) * qty
-            await self.close_position(exit_price, pnl, "Force Square-off")
-            return {"status": "success", "message": f"Position squared off (Paper). PnL: {pnl:.2f}"}
-        else:
-            if self.dhan:
-                security_id = self.current_position.get('security_id', '')
-                result = await self.dhan.place_order(security_id, "SELL", qty, index_name=index_name)
-                logger.info(f"[ORDER] Squareoff result: {result}")
-                if result.get('orderId') or result.get('status') == 'success':
-                    exit_price = bot_state['current_option_ltp']
-                    pnl = (exit_price - self.entry_price) * qty
-                    await self.close_position(exit_price, pnl, "Force Square-off")
-                    return {"status": "success", "message": f"Position squared off. PnL: {pnl:.2f}"}
-        
-        return {"status": "error", "message": "Failed to square off"}
+        exit_price = bot_state['current_option_ltp']
+        pnl = (exit_price - self.entry_price) * qty
+        closed = await self.close_position(exit_price, pnl, "Force Square-off")
+        if closed:
+            suffix = "(Paper)" if bot_state['mode'] == 'paper' else ""
+            return {"status": "success", "message": f"Position squared off {suffix}. PnL: {pnl:.2f}"}
+        return {"status": "error", "message": "Squareoff order not filled (position still open)"}
     
-    async def close_position(self, exit_price: float, pnl: float, reason: str):
+    async def close_position(self, exit_price: float, pnl: float, reason: str) -> bool:
         """Close current position and save trade"""
         if not self.current_position:
-            return
+            return False
         
         trade_id = self.current_position.get('trade_id', '')
         index_name = self.current_position.get('index_name', config['selected_index'])
         option_type = self.current_position.get('option_type', '')
         strike = self.current_position.get('strike', 0)
         security_id = self.current_position.get('security_id', '')
-        
-        # Send exit order to Dhan - MUST place order before updating DB
-        exit_order_placed = False
-        if bot_state['mode'] != 'paper' and self.dhan and security_id:
+        qty = int(self.current_position.get('qty') or 0)
+        if qty <= 0:
             index_config = get_index_config(index_name)
             qty = config['order_qty'] * index_config['lot_size']
-            
-            try:
-                logger.info(f"[ORDER] Placing EXIT SELL order | Trade ID: {trade_id} | Security: {security_id} | Qty: {qty}")
-                result = await self.dhan.place_order(security_id, "SELL", qty, index_name=index_name)
-                
-                if result.get('status') == 'success' and result.get('orderId'):
-                    order_id = result.get('orderId')
-                    exit_order_placed = True
-                    logger.info(f"[ORDER] ✓ EXIT order PLACED | OrderID: {order_id} | Security: {security_id} | Qty: {qty}")
-                    
-                    logger.info(f"[EXIT] ✓ Position closed | {index_name} {option_type} {strike} | Reason: {reason} | PnL: {pnl} | Order Placed: True")
+        
+        exit_order_placed = False
+        filled_exit_price = exit_price
 
-                    # Track last order timestamp (exit order)
-                    self.last_order_time_utc = datetime.now(timezone.utc)
-                    
-                    # Update database in background - don't wait
-                    asyncio.create_task(update_trade_exit(
-                        trade_id=trade_id,
-                        exit_time=datetime.now(timezone.utc).isoformat(),
-                        exit_price=exit_price,
-                        pnl=pnl,
-                        exit_reason=reason
-                    ))
-                else:
-                    logger.error(f"[ORDER] ✗ EXIT order FAILED | Trade: {trade_id} | Result: {result}")
-                    return
+        if bot_state['mode'] != 'paper' and self.dhan and security_id:
+            existing_exit_order_id = self.current_position.get('exit_order_id')
+
+            try:
+                if not existing_exit_order_id:
+                    logger.info(f"[ORDER] Placing EXIT SELL order | Trade ID: {trade_id} | Security: {security_id} | Qty: {qty}")
+                    result = await self.dhan.place_order(security_id, "SELL", qty, index_name=index_name)
+
+                    if result.get('status') == 'success' and result.get('orderId'):
+                        existing_exit_order_id = result.get('orderId')
+                        self.current_position['exit_order_id'] = existing_exit_order_id
+                        bot_state['current_position'] = self.current_position
+                        exit_order_placed = True
+                        self.last_order_time_utc = datetime.now(timezone.utc)
+                        logger.info(f"[ORDER] ✓ EXIT order PLACED | OrderID: {existing_exit_order_id} | Security: {security_id} | Qty: {qty}")
+                    else:
+                        logger.error(f"[ORDER] ✗ EXIT order FAILED | Trade: {trade_id} | Result: {result}")
+                        return False
+
+                verify = await self.dhan.verify_order_filled(
+                    order_id=str(existing_exit_order_id),
+                    security_id=str(security_id),
+                    expected_qty=int(qty),
+                    timeout_seconds=30
+                )
+
+                if not verify.get('filled'):
+                    status = verify.get('status')
+                    logger.warning(
+                        f"[ORDER] ✗ EXIT not filled yet | Trade: {trade_id} | OrderID: {existing_exit_order_id} | Status: {status} | {verify.get('message')}"
+                    )
+                    if status in {"REJECTED", "CANCELLED", "ERROR"}:
+                        self.current_position.pop('exit_order_id', None)
+                        bot_state['current_position'] = self.current_position
+                    return False
+
+                avg_price = float(verify.get('average_price') or 0)
+                if avg_price > 0:
+                    filled_exit_price = round(avg_price / 0.05) * 0.05
+                    filled_exit_price = round(filled_exit_price, 2)
+                exit_order_placed = True
+
             except Exception as e:
-                logger.error(f"[ORDER] ✗ Error placing EXIT order: {e} | Trade: {trade_id}", exc_info=True)
-                return
+                logger.error(f"[ORDER] ✗ Error placing/verifying EXIT order: {e} | Trade: {trade_id}", exc_info=True)
+                return False
         elif not security_id:
             logger.warning(f"[WARNING] Cannot send exit order - security_id missing for {index_name} {option_type} | Trade: {trade_id}")
             logger.info(f"[EXIT] ✓ Position closed | {index_name} {option_type} {strike} | Reason: {reason} | PnL: {pnl} | Order Placed: False")
@@ -261,6 +274,18 @@ class TradingBot:
             ))
             # Track last order timestamp (paper exit)
             self.last_order_time_utc = datetime.now(timezone.utc)
+
+        # If we reached here in LIVE mode, the exit is filled. Use filled price for P&L if available.
+        if bot_state['mode'] != 'paper' and self.dhan and security_id:
+            pnl = (filled_exit_price - self.entry_price) * qty
+
+            asyncio.create_task(update_trade_exit(
+                trade_id=trade_id,
+                exit_time=datetime.now(timezone.utc).isoformat(),
+                exit_price=filled_exit_price,
+                pnl=pnl,
+                exit_reason=reason
+            ))
         
         # Update state
         bot_state['daily_pnl'] += pnl
@@ -288,9 +313,9 @@ class TradingBot:
         self.trailing_sl = None
         self.highest_profit = 0
         self.entry_time_utc = None
-        
-        self.macd = None  # MACD used for confirmation
+
         logger.info(f"[EXIT] ✓ Position closed | {index_name} {option_type} {strike} | Reason: {reason} | PnL: {pnl:.2f} | Order Placed: {exit_order_placed}")
+        return True
     
     async def run_loop(self):
         """Main trading loop"""
@@ -334,7 +359,7 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
                 
-                if bot_state['daily_max_loss_triggered']:
+                if bot_state['daily_max_loss_triggered'] and not self.current_position:
                     await asyncio.sleep(5)
                     continue
                 
@@ -348,16 +373,18 @@ class TradingBot:
                         if security_id and not security_id.startswith('SIM_'):
                             option_security_id = int(security_id)
                     
-                    # Fetch Index + Option LTP
+                    # Fetch Index + Option LTP (Dhan SDK is sync; run in thread)
                     if option_security_id:
-                        index_ltp, option_ltp = self.dhan.get_index_and_option_ltp(index_name, option_security_id)
+                        index_ltp, option_ltp = await asyncio.to_thread(
+                            self.dhan.get_index_and_option_ltp, index_name, option_security_id
+                        )
                         if index_ltp > 0:
                             bot_state['index_ltp'] = index_ltp
                         if option_ltp > 0:
                             option_ltp = round(option_ltp / 0.05) * 0.05
                             bot_state['current_option_ltp'] = round(option_ltp, 2)
                     else:
-                        index_ltp = self.dhan.get_index_ltp(index_name)
+                        index_ltp = await asyncio.to_thread(self.dhan.get_index_ltp, index_name)
                         if index_ltp > 0:
                             bot_state['index_ltp'] = index_ltp
                 
@@ -664,7 +691,9 @@ class TradingBot:
             return False
         
         index_config = get_index_config(config['selected_index'])
-        qty = config['order_qty'] * index_config['lot_size']
+        qty = int(self.current_position.get('qty') or 0)
+        if qty <= 0:
+            qty = config['order_qty'] * index_config['lot_size']
         profit_points = current_ltp - self.entry_price
         
         # Check target first (if enabled)
@@ -674,8 +703,8 @@ class TradingBot:
             logger.info(
                 f"[EXIT] Target hit | LTP={current_ltp:.2f} | Entry={self.entry_price:.2f} | Profit={profit_points:.2f} pts | Target={target_points:.2f} pts"
             )
-            await self.close_position(current_ltp, pnl, "Target Hit")
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Target Hit")
+            return bool(closed)
         
         # Update trailing SL
         await self.check_trailing_sl(current_ltp)
@@ -684,8 +713,8 @@ class TradingBot:
         if self.trailing_sl and current_ltp <= self.trailing_sl:
             pnl = (current_ltp - self.entry_price) * qty
             logger.info(f"[EXIT] Trailing SL hit | LTP={current_ltp:.2f} | SL={self.trailing_sl:.2f}")
-            await self.close_position(current_ltp, pnl, "Trailing SL Hit")
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Trailing SL Hit")
+            return bool(closed)
         
         return False
     
@@ -695,7 +724,9 @@ class TradingBot:
             return False
         
         index_config = get_index_config(config['selected_index'])
-        qty = config['order_qty'] * index_config['lot_size']
+        qty = int(self.current_position.get('qty') or 0)
+        if qty <= 0:
+            qty = config['order_qty'] * index_config['lot_size']
         profit_points = current_ltp - self.entry_price
         pnl = profit_points * qty
         
@@ -705,9 +736,10 @@ class TradingBot:
             logger.warning(
                 f"[EXIT] ✗ Daily max loss BREACHED! | Current Daily P&L=₹{bot_state['daily_pnl']:.2f} | This trade P&L=₹{pnl:.2f} | Limit=₹{-daily_max_loss:.2f} | FORCE SQUAREOFF"
             )
-            await self.close_position(current_ltp, pnl, "Daily Max Loss")
-            bot_state['daily_max_loss_triggered'] = True
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Daily Max Loss")
+            if closed:
+                bot_state['daily_max_loss_triggered'] = True
+            return bool(closed)
         
         # Check max loss per trade (if enabled)
         max_loss_per_trade = config.get('max_loss_per_trade', 0)
@@ -715,8 +747,8 @@ class TradingBot:
             logger.info(
                 f"[EXIT] Max loss per trade hit | LTP={current_ltp:.2f} | Entry={self.entry_price:.2f} | Loss=₹{abs(pnl):.2f} | Limit=₹{max_loss_per_trade:.2f}"
             )
-            await self.close_position(current_ltp, pnl, "Max Loss Per Trade")
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Max Loss Per Trade")
+            return bool(closed)
 
         # Check target (if enabled)
         target_points = config.get('target_points', 0)
@@ -724,8 +756,8 @@ class TradingBot:
             logger.info(
                 f"[EXIT] Target hit (tick) | LTP={current_ltp:.2f} | Entry={self.entry_price:.2f} | Profit={profit_points:.2f} pts | Target={target_points:.2f} pts"
             )
-            await self.close_position(current_ltp, pnl, "Target Hit")
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Target Hit")
+            return bool(closed)
         
         # Update trailing SL values
         await self.check_trailing_sl(current_ltp)
@@ -734,8 +766,8 @@ class TradingBot:
         if self.trailing_sl and current_ltp <= self.trailing_sl:
             pnl = (current_ltp - self.entry_price) * qty
             logger.info(f"[EXIT] Trailing SL hit (tick) | LTP={current_ltp:.2f} | SL={self.trailing_sl:.2f}")
-            await self.close_position(current_ltp, pnl, "Trailing SL Hit")
-            return True
+            closed = await self.close_position(current_ltp, pnl, "Trailing SL Hit")
+            return bool(closed)
         
         return False
     
@@ -744,7 +776,11 @@ class TradingBot:
         exited = False
         index_name = config['selected_index']
         index_config = get_index_config(index_name)
-        qty = config['order_qty'] * index_config['lot_size']
+        qty = 0
+        if self.current_position:
+            qty = int(self.current_position.get('qty') or 0)
+        if qty <= 0:
+            qty = config['order_qty'] * index_config['lot_size']
         
         # Check for exit on SuperTrend direction reversal (PRIMARY exit trigger)
         # Exit based on SuperTrend direction change - this is the critical signal
@@ -761,10 +797,11 @@ class TradingBot:
                     exit_price = bot_state['current_option_ltp']
                     pnl = (exit_price - self.entry_price) * qty
                     logger.warning(f"[SIGNAL] ✗ REVERSAL: SuperTrend flipped RED - Exiting CE position IMMEDIATELY | P&L=₹{pnl:.2f}")
-                    await self.close_position(exit_price, pnl, "SuperTrend Reversal")
-                    exited = True
-                    # Clear last_signal to allow re-entry on opposite signal (RED)
-                    self.last_signal = None
+                    closed = await self.close_position(exit_price, pnl, "SuperTrend Reversal")
+                    exited = bool(closed)
+                    if closed:
+                        # Clear last_signal to allow re-entry on opposite signal (RED)
+                        self.last_signal = None
                     # Continue to enter opposite position (PE)
             
             elif position_type == 'PE' and st_direction == 1:  # Holding PE but ST flipped GREEN
@@ -774,10 +811,11 @@ class TradingBot:
                     exit_price = bot_state['current_option_ltp']
                     pnl = (exit_price - self.entry_price) * qty
                     logger.warning(f"[SIGNAL] ✗ REVERSAL: SuperTrend flipped GREEN - Exiting PE position IMMEDIATELY | P&L=₹{pnl:.2f}")
-                    await self.close_position(exit_price, pnl, "SuperTrend Reversal")
-                    exited = True
-                    # Clear last_signal to allow re-entry on opposite signal (GREEN)
-                    self.last_signal = None
+                    closed = await self.close_position(exit_price, pnl, "SuperTrend Reversal")
+                    exited = bool(closed)
+                    if closed:
+                        # Clear last_signal to allow re-entry on opposite signal (GREEN)
+                        self.last_signal = None
                     # Continue to enter opposite position (CE)
         
         # Check if new trade allowed
@@ -911,11 +949,13 @@ class TradingBot:
             # Position size = Risk Amount / (SL points * lot size * point value)
             # For options: 1 point = 1 rupee per lot
             sl_points = config['initial_stoploss']
-            max_qty = int(risk_per_trade / (sl_points * index_config['lot_size']))
-            qty = max(1, min(max_qty, config['order_qty']))  # Between 1 and order_qty
-            logger.info(f"[POSITION] Size adjusted for risk: {qty} lots (Risk: ₹{risk_per_trade}, SL: {sl_points}pts)")
+            max_lots = int(risk_per_trade / (sl_points * index_config['lot_size']))
+            lots = max(1, min(max_lots, int(config['order_qty'])))  # Between 1 and configured max lots
+            qty = lots * index_config['lot_size']
+            logger.info(f"[POSITION] Size adjusted for risk: {lots} lots ({qty} qty) (Risk: ₹{risk_per_trade}, SL: {sl_points}pts)")
         else:
-            qty = config['order_qty'] * index_config['lot_size']
+            lots = int(config['order_qty'])
+            qty = lots * index_config['lot_size']
         
         trade_id = f"T{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
@@ -933,29 +973,9 @@ class TradingBot:
         entry_price = 0
         security_id = ""
         
-        # Get real entry price
-        if self.dhan:
-            try:
-                security_id = await self.dhan.get_atm_option_security_id(index_name, strike, option_type, expiry)
-                
-                if security_id:
-                    option_ltp = await self.dhan.get_option_ltp(
-                        security_id=security_id,
-                        strike=strike,
-                        option_type=option_type,
-                        expiry=expiry,
-                        index_name=index_name
-                    )
-                    if option_ltp > 0:
-                        entry_price = round(option_ltp / 0.05) * 0.05
-                        entry_price = round(entry_price, 2)
-            except Exception as e:
-                logger.error("[ERROR] Failed to get entry price: %s", e)
-        
-        # Paper mode
+        # Paper mode (fully simulated pricing; avoids mixing simulated index candles with live option quotes)
         if bot_state['mode'] == 'paper':
-            if not security_id:
-                security_id = f"SIM_{index_name}_{strike}_{option_type}"
+            security_id = f"SIM_{index_name}_{strike}_{option_type}"
             
             if entry_price <= 0:
                 distance = abs(index_ltp - strike)
@@ -973,9 +993,26 @@ class TradingBot:
             if not self.dhan:
                 logger.error("[ERROR] Dhan API not initialized")
                 return
-            
-            if not security_id:
-                logger.error(f"[ERROR] Could not find security ID for {index_name} {strike} {option_type}")
+
+            # Resolve instrument + a more accurate entry price from market data
+            try:
+                security_id = await self.dhan.get_atm_option_security_id(index_name, strike, option_type, expiry)
+                if not security_id:
+                    logger.error(f"[ERROR] Could not find security ID for {index_name} {strike} {option_type}")
+                    return
+
+                option_ltp = await self.dhan.get_option_ltp(
+                    security_id=security_id,
+                    strike=strike,
+                    option_type=option_type,
+                    expiry=expiry,
+                    index_name=index_name
+                )
+                if option_ltp > 0:
+                    entry_price = round(option_ltp / 0.05) * 0.05
+                    entry_price = round(entry_price, 2)
+            except Exception as e:
+                logger.error("[ERROR] Failed to get entry price: %s", e)
                 return
             
             result = await self.dhan.place_order(security_id, "BUY", qty, index_name=index_name)
@@ -988,13 +1025,34 @@ class TradingBot:
             
             # Order placed successfully - save to DB immediately
             order_id = result.get('orderId')
+
+            # Track last order timestamp (entry order) right after placing the order
+            self.last_order_time_utc = datetime.now(timezone.utc)
+
+            verify = await self.dhan.verify_order_filled(
+                order_id=str(order_id),
+                security_id=str(security_id),
+                expected_qty=int(qty),
+                timeout_seconds=30
+            )
+            if not verify.get('filled'):
+                logger.error(
+                    f"[ORDER] ✗ Entry order NOT filled | OrderID: {order_id} | Status: {verify.get('status')} | {verify.get('message')}"
+                )
+                return
+
+            avg_price = float(verify.get('average_price') or 0)
+            if avg_price > 0:
+                entry_price = round(avg_price / 0.05) * 0.05
+                entry_price = round(entry_price, 2)
             
             logger.info(
                 f"[ENTRY] LIVE | {index_name} {option_type} {strike} | Expiry: {expiry} | OrderID: {order_id} | Fill Price: {entry_price} | Qty: {qty}"
             )
 
-        # Track last order timestamp (entry order)
-        self.last_order_time_utc = datetime.now(timezone.utc)
+        # Track last order timestamp (paper mode entry)
+        if bot_state['mode'] == 'paper':
+            self.last_order_time_utc = datetime.now(timezone.utc)
         
         # Save position
         self.current_position = {
@@ -1004,6 +1062,7 @@ class TradingBot:
             'expiry': expiry,
             'security_id': security_id,
             'index_name': index_name,
+            'qty': qty,
             'entry_time': datetime.now(timezone.utc).isoformat()
         }
         self.entry_price = entry_price
@@ -1034,6 +1093,3 @@ class TradingBot:
             'created_at': datetime.now(timezone.utc).isoformat()
         }))
 
-
-# Global bot instance
-trading_bot = TradingBot()

@@ -2,6 +2,8 @@
 import aiosqlite
 from config import DB_PATH, config
 import logging
+import json
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,29 @@ async def init_db():
                 created_at TEXT
             )
         ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS strategies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                applied_at TEXT
+            )
+        ''')
         await db.commit()
+
+        # Migration: add applied_at if table existed before
+        try:
+            cursor = await db.execute("PRAGMA table_info(strategies)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'applied_at' not in columns:
+                await db.execute("ALTER TABLE strategies ADD COLUMN applied_at TEXT")
+                await db.commit()
+                logger.info("[DB] Added applied_at column to strategies table")
+        except Exception as e:
+            logger.error(f"[DB] Strategies migration error: {e}")
         
         # Migration: Add index_name column if it doesn't exist
         try:
@@ -71,6 +95,155 @@ async def init_db():
                 logger.info("[DB] Added index_name column to trades table")
         except Exception as e:
             logger.error(f"[DB] Migration error: {e}")
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def upsert_strategy(name: str, strategy_config: dict) -> dict:
+    """Create/update a saved strategy.
+
+    Stores config as JSON. Name is unique.
+    """
+    if not name or not str(name).strip():
+        raise ValueError("Strategy name is required")
+
+    name = str(name).strip()
+    payload = json.dumps(strategy_config or {}, separators=(",", ":"), ensure_ascii=False)
+    now = _utc_now_iso()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            '''
+            INSERT INTO strategies (name, config_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                config_json=excluded.config_json,
+                updated_at=excluded.updated_at
+            ''',
+            (name, payload, now, now),
+        )
+        await db.commit()
+
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, created_at, updated_at, applied_at FROM strategies WHERE name = ?",
+            (name,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else {"name": name}
+
+
+async def list_strategies() -> list:
+    """List saved strategies (metadata only)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, created_at, updated_at, applied_at FROM strategies ORDER BY updated_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_strategy(strategy_id: int) -> dict | None:
+    """Get a strategy including its JSON config."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, config_json, created_at, updated_at, applied_at FROM strategies WHERE id = ?",
+            (int(strategy_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            try:
+                data["config"] = json.loads(data.get("config_json") or "{}")
+            except Exception:
+                data["config"] = {}
+            return data
+
+
+async def delete_strategy(strategy_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM strategies WHERE id = ?", (int(strategy_id),))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def rename_strategy(strategy_id: int, new_name: str) -> dict:
+    if not new_name or not str(new_name).strip():
+        raise ValueError("New name is required")
+    new_name = str(new_name).strip()
+    now = _utc_now_iso()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE strategies SET name = ?, updated_at = ? WHERE id = ?",
+            (new_name, now, int(strategy_id)),
+        )
+        await db.commit()
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, name, created_at, updated_at, applied_at FROM strategies WHERE id = ?",
+            (int(strategy_id),),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                raise ValueError("Strategy not found")
+            return dict(row)
+
+
+async def duplicate_strategy(strategy_id: int, new_name: str) -> dict:
+    original = await get_strategy(strategy_id)
+    if not original:
+        raise ValueError("Strategy not found")
+    return await upsert_strategy(new_name, original.get("config") or {})
+
+
+async def mark_strategy_applied(strategy_id: int) -> None:
+    now = _utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE strategies SET applied_at = ? WHERE id = ?",
+            (now, int(strategy_id)),
+        )
+        await db.commit()
+
+
+async def export_strategies() -> list:
+    """Export strategies as list of {name, config}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT name, config_json FROM strategies ORDER BY updated_at DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            exported = []
+            for r in rows:
+                cfg = {}
+                try:
+                    cfg = json.loads(r["config_json"] or "{}")
+                except Exception:
+                    cfg = {}
+                exported.append({"name": r["name"], "config": cfg})
+            return exported
+
+
+async def import_strategies(items: list[dict]) -> dict:
+    """Import strategies from a list. Upserts by name."""
+    imported = 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        cfg = item.get("config")
+        if not name or not isinstance(cfg, dict):
+            continue
+        await upsert_strategy(name, cfg)
+        imported += 1
+    return {"imported": imported}
 
 async def load_config():
     """Load config from database"""
@@ -111,6 +284,7 @@ async def save_config():
 async def save_trade(trade_data: dict):
     """Save trade to database"""
     try:
+        async with aiosqlite.connect(DB_PATH) as db:
             await db.execute('''
                 INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

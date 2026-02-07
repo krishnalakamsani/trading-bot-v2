@@ -33,6 +33,7 @@ const ControlsPanel = () => {
     stop: false,
     squareoff: false,
     tradingEnabled: false,
+    bypassMarketHours: false,
   });
 
   const handleStart = async () => {
@@ -61,6 +62,12 @@ const ControlsPanel = () => {
     setLoading((prev) => ({ ...prev, tradingEnabled: true }));
     await updateConfig({ trading_enabled: checked });
     setLoading((prev) => ({ ...prev, tradingEnabled: false }));
+  };
+
+  const handleBypassMarketHoursChange = async (checked) => {
+    setLoading((prev) => ({ ...prev, bypassMarketHours: true }));
+    await updateConfig({ bypass_market_hours: checked });
+    setLoading((prev) => ({ ...prev, bypassMarketHours: false }));
   };
 
   const handleIndexChange = async (value) => {
@@ -255,6 +262,29 @@ const ControlsPanel = () => {
               onCheckedChange={handleTradingEnabledChange}
               disabled={loading.tradingEnabled}
               data-testid="trading-enabled-toggle"
+            />
+            <span className="text-xs font-medium text-emerald-700">On</span>
+          </div>
+        </div>
+
+        {/* Bypass Market Hours */}
+        <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
+          <div>
+            <Label htmlFor="bypass-market-hours-toggle" className="text-sm font-medium">
+              Bypass Market Hours
+            </Label>
+            <p className="text-xs text-gray-500">
+              Run outside market hours (use with caution)
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-gray-500">Off</span>
+            <Switch
+              id="bypass-market-hours-toggle"
+              checked={!!config?.bypass_market_hours}
+              onCheckedChange={handleBypassMarketHoursChange}
+              disabled={!canChangeSettings || loading.bypassMarketHours}
+              data-testid="bypass-market-hours-toggle"
             />
             <span className="text-xs font-medium text-emerald-700">On</span>
           </div>

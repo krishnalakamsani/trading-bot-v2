@@ -249,6 +249,7 @@ class DhanAPI:
     async def get_option_chain(self, index_name: str = "NIFTY", expiry: str = None, force_refresh: bool = False) -> dict:
         """Get option chain with caching"""
         try:
+            import asyncio
             index_config = get_index_config(index_name)
             security_id = index_config["security_id"]
             
@@ -274,7 +275,8 @@ class DhanAPI:
             
             logger.info(f"Fetching fresh option chain: {index_name}, expiry={expiry}")
             
-            response = self.dhan.option_chain(
+            response = await asyncio.to_thread(
+                self.dhan.option_chain,
                 under_security_id=security_id,
                 under_exchange_segment='IDX_I',
                 expiry=expiry
@@ -293,12 +295,14 @@ class DhanAPI:
     async def get_nearest_expiry(self, index_name: str = "NIFTY") -> str:
         """Get nearest expiry date"""
         try:
+            import asyncio
             index_config = get_index_config(index_name)
             security_id = index_config["security_id"]
             
             for segment in ['IDX_I', 'NSE_FNO', 'INDEX']:
                 logger.info(f"Trying expiry_list for {index_name} with segment: {segment}")
-                response = self.dhan.expiry_list(
+                response = await asyncio.to_thread(
+                    self.dhan.expiry_list,
                     under_security_id=security_id,
                     under_exchange_segment=segment
                 )
@@ -484,6 +488,7 @@ class DhanAPI:
     async def place_order(self, security_id: str, transaction_type: str, qty: int, index_name: str = None) -> dict:
         """Place a market order synchronously (Dhan API is synchronous)"""
         try:
+            import asyncio
             if not self._segment_ready:
                 return {
                     "status": "error",
@@ -512,8 +517,9 @@ class DhanAPI:
                 except Exception as e:
                     logger.warning(f"[ORDER] Falling back to {DEFAULT_FNO_SEGMENT} segment for {index_name}: {e}")
 
-            # Dhan API is synchronous, call it directly
-            response = self.dhan.place_order(
+            # Dhan SDK call is synchronous; run in a thread to avoid blocking the event loop.
+            response = await asyncio.to_thread(
+                self.dhan.place_order,
                 security_id=security_id,
                 exchange_segment=exchange_segment,
                 transaction_type=self.dhan.BUY if transaction_type == "BUY" else self.dhan.SELL,
@@ -605,15 +611,17 @@ class DhanAPI:
                 
                 # Check order status
                 try:
-                    orders = self.dhan.get_order_list()
+                    # Dhan SDK call is synchronous; run in a thread to avoid blocking the event loop.
+                    orders = await asyncio.to_thread(self.dhan.get_order_list)
                     if orders and 'data' in orders:
                         for order in orders['data']:
                             if str(order.get('orderId')) == str(order_id):
                                 status = order.get('orderStatus', '').upper()
                                 filled_qty = int(order.get('filledQty', 0))
                                 average_price = float(order.get('averagePrice', 0))
-                                
-                                if status == 'FILLED':
+
+                                filled_statuses = {'FILLED', 'TRADED', 'COMPLETE', 'COMPLETED'}
+                                if status in filled_statuses:
                                     logger.info(f"[ORDER] ✓ Order {order_id} FILLED (attempt #{retry_count}) | Qty: {filled_qty} | Avg Price: {average_price}")
                                     return {
                                         "filled": True,

@@ -95,7 +95,9 @@ def get_position() -> dict:
         return {"has_position": False}
     
     index_config = get_index_config(config['selected_index'])
-    qty = config['order_qty'] * index_config['lot_size']
+    qty = int(bot_state['current_position'].get('qty') or 0)
+    if qty <= 0:
+        qty = config['order_qty'] * index_config['lot_size']
     unrealized_pnl = (bot_state['current_option_ltp'] - bot_state['entry_price']) * qty
     
     return {

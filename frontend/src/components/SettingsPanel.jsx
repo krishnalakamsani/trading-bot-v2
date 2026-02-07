@@ -1,5 +1,7 @@
 import React, { useContext, useState } from "react";
-import { AppContext } from "@/App";
+import axios from "axios";
+import { toast } from "sonner";
+import { API, AppContext } from "@/App";
 import {
   Dialog,
   DialogContent,
@@ -11,11 +13,18 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Key, Settings, ShieldCheck, Eye, EyeOff, Save } from "lucide-react";
 
 const SettingsPanel = ({ onClose }) => {
-  const { config, updateConfig } = useContext(AppContext);
+  const { config, updateConfig, botStatus, position } = useContext(AppContext);
 
   // API Credentials
   const [accessToken, setAccessToken] = useState("");
@@ -36,6 +45,13 @@ const SettingsPanel = ({ onClose }) => {
   const [saving, setSaving] = useState(false);
   const isFirstRender = React.useRef(true);
 
+  // Saved strategies
+  const [strategies, setStrategies] = useState([]);
+  const [strategyName, setStrategyName] = useState("");
+  const [selectedStrategyId, setSelectedStrategyId] = useState("");
+  const [strategiesLoading, setStrategiesLoading] = useState(false);
+  const fileInputRef = React.useRef(null);
+
   // Only sync on first mount, not on every config change to avoid overwriting user edits
   React.useEffect(() => {
     if (isFirstRender.current) {
@@ -51,6 +67,200 @@ const SettingsPanel = ({ onClose }) => {
       isFirstRender.current = false;
     }
   }, []); // Empty dependency array - only run once on mount
+
+  const fetchStrategies = async () => {
+    setStrategiesLoading(true);
+    try {
+      const res = await axios.get(`${API}/strategies`);
+      setStrategies(res.data || []);
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to load strategies");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  React.useEffect(() => {
+    fetchStrategies();
+  }, []);
+
+  const handleSaveStrategy = async () => {
+    const name = String(strategyName || "").trim();
+    if (!name) {
+      toast.error("Enter a strategy name");
+      return;
+    }
+
+    setStrategiesLoading(true);
+    try {
+      await axios.post(`${API}/strategies`, {
+        name,
+        // Backend filters credentials/unknown keys; we snapshot current config.
+        config,
+      });
+      toast.success("Strategy saved");
+      setStrategyName("");
+      await fetchStrategies();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to save strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleApplyAndRun = async () => {
+    if (!selectedStrategyId) {
+      toast.error("Select a strategy first");
+      return;
+    }
+
+    setStrategiesLoading(true);
+    try {
+      const res = await axios.post(`${API}/strategies/${selectedStrategyId}/apply?start=true`);
+      toast.success(res.data?.message || "Strategy applied");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to apply strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleApplyOnly = async () => {
+    if (!selectedStrategyId) {
+      toast.error("Select a strategy first");
+      return;
+    }
+
+    setStrategiesLoading(true);
+    try {
+      const res = await axios.post(`${API}/strategies/${selectedStrategyId}/apply`);
+      toast.success(res.data?.message || "Strategy applied");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to apply strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const canApplyStrategy = !botStatus?.is_running && !position?.has_position;
+
+  const handleDeleteStrategy = async () => {
+    if (!selectedStrategyId) {
+      toast.error("Select a strategy first");
+      return;
+    }
+    const selected = (strategies || []).find((s) => String(s.id) === String(selectedStrategyId));
+    const ok = window.confirm(`Delete strategy '${selected?.name || ""}'?`);
+    if (!ok) return;
+
+    setStrategiesLoading(true);
+    try {
+      await axios.delete(`${API}/strategies/${selectedStrategyId}`);
+      toast.success("Strategy deleted");
+      setSelectedStrategyId("");
+      await fetchStrategies();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to delete strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleRenameStrategy = async () => {
+    if (!selectedStrategyId) {
+      toast.error("Select a strategy first");
+      return;
+    }
+    const name = String(strategyName || "").trim();
+    if (!name) {
+      toast.error("Enter a new name in Strategy Name");
+      return;
+    }
+    setStrategiesLoading(true);
+    try {
+      await axios.patch(`${API}/strategies/${selectedStrategyId}`, { name });
+      toast.success("Strategy renamed");
+      setStrategyName("");
+      await fetchStrategies();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to rename strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleDuplicateStrategy = async () => {
+    if (!selectedStrategyId) {
+      toast.error("Select a strategy first");
+      return;
+    }
+    const name = String(strategyName || "").trim();
+    if (!name) {
+      toast.error("Enter a new name in Strategy Name");
+      return;
+    }
+    setStrategiesLoading(true);
+    try {
+      await axios.post(`${API}/strategies/${selectedStrategyId}/duplicate`, { name });
+      toast.success("Strategy duplicated");
+      setStrategyName("");
+      await fetchStrategies();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to duplicate strategy");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleExportStrategies = async () => {
+    setStrategiesLoading(true);
+    try {
+      const res = await axios.get(`${API}/strategies/export`);
+      const payload = JSON.stringify(res.data || {}, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "strategies.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success("Export downloaded");
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Failed to export strategies");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
+
+  const handleImportClick = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleImportFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    setStrategiesLoading(true);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const strategiesList = parsed?.strategies;
+      if (!Array.isArray(strategiesList)) {
+        toast.error("Invalid file format: expected { strategies: [...] }");
+        return;
+      }
+      const res = await axios.post(`${API}/strategies/import`, { strategies: strategiesList });
+      toast.success(`Imported ${res.data?.imported ?? 0} strategies`);
+      await fetchStrategies();
+    } catch (err) {
+      toast.error("Failed to import strategies");
+    } finally {
+      setStrategiesLoading(false);
+    }
+  };
 
   const handleSaveCredentials = async () => {
     if (!accessToken || !clientId) {
@@ -113,7 +323,7 @@ const SettingsPanel = ({ onClose }) => {
         </DialogHeader>
 
         <Tabs defaultValue="credentials" className="w-full overflow-visible">
-          <TabsList className="grid w-full grid-cols-2">
+          <TabsList className="grid w-full grid-cols-3">
             <TabsTrigger value="credentials" className="text-xs">
               <Key className="w-3 h-3 mr-1" />
               API Keys
@@ -121,6 +331,9 @@ const SettingsPanel = ({ onClose }) => {
             <TabsTrigger value="risk" className="text-xs">
               <ShieldCheck className="w-3 h-3 mr-1" />
               Risk
+            </TabsTrigger>
+            <TabsTrigger value="strategy" className="text-xs">
+              Strategy
             </TabsTrigger>
           </TabsList>
 
@@ -349,6 +562,150 @@ const SettingsPanel = ({ onClose }) => {
                 <Save className="w-3 h-3 mr-1" />
                 {saving ? "Saving..." : "Save Parameters"}
               </Button>
+            </div>
+          </TabsContent>
+
+          {/* Strategy Tab (Saved Strategies) */}
+          <TabsContent value="strategy" className="space-y-4 mt-4 overflow-visible">
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Saved Strategies</div>
+
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={handleImportFile}
+              />
+
+              <div className="space-y-1">
+                <Label htmlFor="strategy-name" className="text-xs text-gray-600">
+                  Strategy Name
+                </Label>
+                <Input
+                  id="strategy-name"
+                  placeholder="e.g. ST+MACD Conservative"
+                  value={strategyName}
+                  onChange={(e) => setStrategyName(e.target.value)}
+                  className="rounded-sm"
+                  data-testid="strategy-name-input"
+                />
+                <p className="text-xs text-gray-500">Saves current settings snapshot (no credentials)</p>
+              </div>
+
+              <div className="space-y-1">
+                <Label className="text-xs text-gray-600">Select Strategy</Label>
+                <Select value={String(selectedStrategyId)} onValueChange={setSelectedStrategyId}>
+                  <SelectTrigger className="w-full rounded-sm" data-testid="strategy-select">
+                    <SelectValue placeholder={strategiesLoading ? "Loading..." : "Choose"} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(strategies || []).map((s) => (
+                      <SelectItem key={s.id} value={String(s.id)}>
+                        {s.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={handleSaveStrategy}
+                  disabled={strategiesLoading}
+                  size="sm"
+                  className="rounded-sm btn-active"
+                  data-testid="save-strategy-btn"
+                >
+                  <Save className="w-3 h-3 mr-1" />
+                  Save Strategy
+                </Button>
+                <Button
+                  onClick={handleApplyOnly}
+                  disabled={strategiesLoading || !selectedStrategyId || !canApplyStrategy}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="apply-strategy-btn"
+                >
+                  Apply Only
+                </Button>
+                <Button
+                  onClick={handleApplyAndRun}
+                  disabled={strategiesLoading || !selectedStrategyId || !canApplyStrategy}
+                  size="sm"
+                  className="rounded-sm btn-active"
+                  data-testid="apply-run-strategy-btn"
+                >
+                  Apply & Run
+                </Button>
+                <Button
+                  onClick={handleRenameStrategy}
+                  disabled={strategiesLoading || !selectedStrategyId}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="rename-strategy-btn"
+                >
+                  Rename
+                </Button>
+                <Button
+                  onClick={handleDuplicateStrategy}
+                  disabled={strategiesLoading || !selectedStrategyId}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="duplicate-strategy-btn"
+                >
+                  Duplicate
+                </Button>
+                <Button
+                  onClick={handleDeleteStrategy}
+                  disabled={strategiesLoading || !selectedStrategyId}
+                  size="sm"
+                  variant="destructive"
+                  className="rounded-sm"
+                  data-testid="delete-strategy-btn"
+                >
+                  Delete
+                </Button>
+                <Button
+                  onClick={fetchStrategies}
+                  disabled={strategiesLoading}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="refresh-strategies-btn"
+                >
+                  Refresh
+                </Button>
+                <Button
+                  onClick={handleExportStrategies}
+                  disabled={strategiesLoading}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="export-strategies-btn"
+                >
+                  Export
+                </Button>
+                <Button
+                  onClick={handleImportClick}
+                  disabled={strategiesLoading}
+                  size="sm"
+                  variant="outline"
+                  className="rounded-sm"
+                  data-testid="import-strategies-btn"
+                >
+                  Import
+                </Button>
+              </div>
+
+              <div className="text-xs text-gray-500">
+                {!canApplyStrategy
+                  ? "Stop the bot and close position to apply."
+                  : "Apply requires bot stopped and no open position."}
+              </div>
             </div>
           </TabsContent>
         </Tabs>

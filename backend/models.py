@@ -1,6 +1,31 @@
 # Pydantic models for API requests/responses
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
+
+
+class StrategyCreate(BaseModel):
+    name: str
+    # Optional override; if omitted backend can snapshot current config.
+    config: Optional[Dict[str, Any]] = None
+
+
+class StrategySummary(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    updated_at: str
+
+
+class StrategyRename(BaseModel):
+    name: str
+
+
+class StrategyDuplicate(BaseModel):
+    name: str
+
+
+class StrategiesImport(BaseModel):
+    strategies: list[dict]
 
 class ConfigUpdate(BaseModel):
     dhan_access_token: Optional[str] = None

@@ -14,8 +14,24 @@ from typing import List
 
 # Local imports
 from config import ROOT_DIR, bot_state, config
-from models import ConfigUpdate
-from database import init_db, load_config, get_trades, get_trade_analytics
+import re
+
+from models import ConfigUpdate, StrategyCreate, StrategyRename, StrategyDuplicate, StrategiesImport
+from database import (
+    init_db,
+    load_config,
+    get_trades,
+    get_trade_analytics,
+    upsert_strategy,
+    list_strategies,
+    get_strategy,
+    delete_strategy,
+    rename_strategy,
+    duplicate_strategy,
+    export_strategies,
+    import_strategies,
+    mark_strategy_applied,
+)
 import bot_service
 
 # Configure logging
@@ -48,11 +64,20 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        if not self.active_connections:
+            return
+
+        # Send in a bounded way; drop broken/slow sockets to avoid log spam.
+        stale: List[WebSocket] = []
+        for connection in list(self.active_connections):
             try:
-                await connection.send_json(message)
+                await asyncio.wait_for(connection.send_json(message), timeout=2)
             except Exception as e:
-                logger.error(f"[WS] Broadcast error: {e}")
+                stale.append(connection)
+                logger.warning(f"[WS] Broadcast failed; dropping client: {e}")
+
+        for ws in stale:
+            self.disconnect(ws)
 
 
 manager = ConnectionManager()
@@ -70,6 +95,71 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
+
+
+def _filter_strategy_config(candidate: dict) -> dict:
+    """Allow only known config keys; never persist/apply credentials."""
+    if not isinstance(candidate, dict):
+        return {}
+
+    allowed_keys = set(config.keys())
+    disallowed = {"dhan_access_token", "dhan_client_id"}
+    allowed_keys -= disallowed
+
+    filtered = {}
+    for k, v in candidate.items():
+        if k in allowed_keys:
+            filtered[k] = v
+    return filtered
+
+
+def _validate_strategy_name(name: str) -> str:
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("Strategy name is required")
+    if len(name) > 60:
+        raise ValueError("Strategy name too long (max 60 chars)")
+    # Allow letters, numbers, spaces, and a few safe separators
+    if not re.match(r"^[A-Za-z0-9 _\-\.\+\(\)\[\]]+$", name):
+        raise ValueError("Strategy name contains unsupported characters")
+    return name
+
+
+def _validate_strategy_config(cfg: dict) -> None:
+    if not isinstance(cfg, dict):
+        raise ValueError("Strategy config must be an object")
+
+    st_period = int(cfg.get("supertrend_period", 7) or 7)
+    if st_period < 1 or st_period > 200:
+        raise ValueError("supertrend_period out of range")
+
+    st_mult = float(cfg.get("supertrend_multiplier", 4) or 4)
+    if st_mult <= 0 or st_mult > 50:
+        raise ValueError("supertrend_multiplier out of range")
+
+    macd_fast = int(cfg.get("macd_fast", 12) or 12)
+    macd_slow = int(cfg.get("macd_slow", 26) or 26)
+    macd_sig = int(cfg.get("macd_signal", 9) or 9)
+    if macd_fast < 1 or macd_slow < 1 or macd_sig < 1:
+        raise ValueError("MACD periods must be >= 1")
+    if macd_fast >= macd_slow:
+        raise ValueError("macd_fast must be less than macd_slow")
+
+    ind = str(cfg.get("indicator_type", "supertrend_macd") or "").lower()
+    if ind not in ("supertrend", "supertrend_macd"):
+        raise ValueError("indicator_type must be 'supertrend' or 'supertrend_macd'")
+
+    for key in ("min_trade_gap", "min_hold_seconds", "min_order_cooldown_seconds"):
+        if key in cfg and cfg[key] is not None:
+            v = int(cfg[key])
+            if v < 0 or v > 3600:
+                raise ValueError(f"{key} out of range")
+
+    if "htf_filter_timeframe" in cfg and cfg["htf_filter_timeframe"] is not None:
+        v = int(cfg["htf_filter_timeframe"])
+        # Current backend implementation constrains this to 60s.
+        if v != 60:
+            raise ValueError("htf_filter_timeframe currently supports only 60 seconds")
 
 
 # ==================== API Routes ====================
@@ -203,6 +293,125 @@ async def squareoff():
     return await bot_service.squareoff_position()
 
 
+# ==================== Strategies ====================
+
+@api_router.get("/strategies")
+async def get_strategies():
+    """List saved strategies"""
+    return await list_strategies()
+
+
+@api_router.post("/strategies")
+async def save_strategy(payload: StrategyCreate):
+    """Save a named strategy (config snapshot).
+
+    If payload.config is omitted, uses current backend config snapshot.
+    Credentials are never stored.
+    """
+    name = _validate_strategy_name(payload.name)
+    snapshot = payload.config if payload.config is not None else dict(config)
+    safe = _filter_strategy_config(snapshot)
+    _validate_strategy_config(safe)
+    try:
+        result = await upsert_strategy(name, safe)
+        return {"status": "success", "strategy": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_router.delete("/strategies/{strategy_id}")
+async def remove_strategy(strategy_id: int):
+    ok = await delete_strategy(strategy_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    return {"status": "success"}
+
+
+@api_router.patch("/strategies/{strategy_id}")
+async def update_strategy_name(strategy_id: int, payload: StrategyRename):
+    try:
+        new_name = _validate_strategy_name(payload.name)
+        result = await rename_strategy(strategy_id, new_name)
+        return {"status": "success", "strategy": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_router.post("/strategies/{strategy_id}/duplicate")
+async def duplicate_strategy_api(strategy_id: int, payload: StrategyDuplicate):
+    try:
+        new_name = _validate_strategy_name(payload.name)
+        result = await duplicate_strategy(strategy_id, new_name)
+        return {"status": "success", "strategy": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_router.get("/strategies/export")
+async def export_strategies_api():
+    return {"strategies": await export_strategies()}
+
+
+@api_router.post("/strategies/import")
+async def import_strategies_api(payload: StrategiesImport):
+    # Filter + validate each item
+    cleaned = []
+    for item in payload.strategies or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            name = _validate_strategy_name(item.get("name"))
+        except Exception:
+            continue
+        safe = _filter_strategy_config(item.get("config") or {})
+        try:
+            _validate_strategy_config(safe)
+        except Exception:
+            continue
+        cleaned.append({"name": name, "config": safe})
+
+    result = await import_strategies(cleaned)
+    return {"status": "success", **result}
+
+
+@api_router.post("/strategies/{strategy_id}/apply")
+async def apply_strategy(strategy_id: int, start: bool = Query(default=False)):
+    """Apply a saved strategy to current config. Optionally start the bot."""
+    if bot_state.get("is_running"):
+        raise HTTPException(status_code=400, detail="Stop the bot before applying a strategy")
+    if bot_state.get("current_position"):
+        raise HTTPException(status_code=400, detail="Close position before applying a strategy")
+
+    strategy = await get_strategy(strategy_id)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    safe_updates = _filter_strategy_config(strategy.get("config") or {})
+    _validate_strategy_config(safe_updates)
+    result = await bot_service.update_config_values(safe_updates)
+    if result.get("status") != "success":
+        return {"status": "error", "message": "Failed to apply strategy", "result": result}
+
+    await mark_strategy_applied(strategy_id)
+
+    if start:
+        start_result = await bot_service.start_bot()
+        return {
+            "status": "success",
+            "message": f"Applied strategy '{strategy.get('name')}' and started bot",
+            "strategy": {"id": strategy.get("id"), "name": strategy.get("name")},
+            "apply": result,
+            "start": start_result,
+        }
+
+    return {
+        "status": "success",
+        "message": f"Applied strategy '{strategy.get('name')}'",
+        "strategy": {"id": strategy.get("id"), "name": strategy.get("name")},
+        "apply": result,
+    }
+
+
 # ==================== WebSocket ====================
 
 @app.websocket("/ws")
@@ -216,14 +425,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 if data == "ping":
                     await websocket.send_text("pong")
             except asyncio.TimeoutError:
-                await websocket.send_json({
-                    "type": "heartbeat", 
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                })
+                try:
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                except Exception:
+                    break
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"[WS] Error: {e}")
+    except Exception:
+        manager.disconnect(websocket)
+    finally:
         manager.disconnect(websocket)
 
 
