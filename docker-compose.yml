@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg15
@@ -13,6 +11,11 @@ services:
       - "5432:5432"
     volumes:
       - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market -d marketdata -h localhost -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
       - niftyalgo-network
 
@@ -38,7 +41,8 @@ services:
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
     depends_on:
-      - timescaledb
+      timescaledb:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/v1/health"]
       interval: 30s
@@ -53,6 +57,7 @@ services:
       dockerfile: Dockerfile
     container_name: niftyalgo-market-data-backfill
     restart: "no"
+    profiles: ["backfill"]
     environment:
       - POSTGRES_DSN=postgresql://market:market@timescaledb:5432/marketdata
       - SYMBOLS=NIFTY,BANKNIFTY,FINNIFTY,SENSEX
@@ -66,7 +71,8 @@ services:
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
     depends_on:
-      - timescaledb
+      timescaledb:
+        condition: service_healthy
     command: ["python", "-m", "app.backfill_main"]
     networks:
       - niftyalgo-network
