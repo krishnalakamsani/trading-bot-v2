@@ -707,6 +707,7 @@ const SettingsPanel = ({ onClose }) => {
                   : "Apply requires bot stopped and no open position."}
               </div>
             </div>
+
           </TabsContent>
         </Tabs>
       </DialogContent>

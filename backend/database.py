@@ -272,25 +272,164 @@ async def import_strategies(items: list[dict]) -> dict:
 async def load_config():
     """Load config from database"""
     try:
+        import os
+
+        env_lock = {
+            "market_data_provider": "MARKET_DATA_PROVIDER",
+            "mds_base_url": "MDS_BASE_URL",
+            "mds_poll_seconds": "MDS_POLL_SECONDS",
+            "store_tick_data": "STORE_TICK_DATA",
+            "store_candle_data": "STORE_CANDLE_DATA",
+            "prune_db_on_startup": "PRUNE_DB_ON_STARTUP",
+            "max_candle_rows": "MAX_CANDLE_ROWS",
+            "max_tick_rows": "MAX_TICK_ROWS",
+            "vacuum_db_on_prune": "VACUUM_DB_ON_PRUNE",
+            "enable_internal_market_data_service": "ENABLE_INTERNAL_MARKET_DATA_SERVICE",
+        }
+
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute('SELECT key, value FROM config') as cursor:
                 rows = await cursor.fetchall()
                 logger.info(f"[DB] Loaded {len(rows)} config entries from database")
                 for key, value in rows:
                     if key in config:
-                        # Integer fields
-                        if key in ['order_qty', 'max_trades_per_day', 'candle_interval', 'supertrend_period', 'min_trade_gap', 'htf_filter_timeframe', 'min_hold_seconds', 'min_order_cooldown_seconds', 'macd_fast', 'macd_slow', 'macd_signal']:
+                        env_var = env_lock.get(key)
+                        if env_var and os.getenv(env_var) is not None:
+                            continue
+                        int_keys = {
+                            'order_qty',
+                            'max_trades_per_day',
+                            'candle_interval',
+                            'supertrend_period',
+                            'min_trade_gap',
+                            'htf_filter_timeframe',
+                            'min_hold_seconds',
+                            'min_order_cooldown_seconds',
+                            'macd_fast',
+                            'macd_slow',
+                            'macd_signal',
+                            'max_candle_rows',
+                            'max_tick_rows',
+                        }
+                        float_keys = {
+                            'daily_max_loss',
+                            'initial_stoploss',
+                            'max_loss_per_trade',
+                            'trail_start_profit',
+                            'trail_step',
+                            'target_points',
+                            'risk_per_trade',
+                            'supertrend_multiplier',
+                            'market_data_poll_seconds',
+                            'tick_persist_interval_seconds',
+                            'paper_replay_speed',
+                            'mds_poll_seconds',
+                        }
+                        bool_keys = {
+                            'trade_only_on_flip',
+                            'trading_enabled',
+                            'htf_filter_enabled',
+                            'macd_confirmation_enabled',
+                            'bypass_market_hours',
+                            'store_tick_data',
+                            'store_candle_data',
+                            'pause_market_data_when_closed',
+                            'paper_replay_enabled',
+                            'prune_db_on_startup',
+                            'vacuum_db_on_prune',
+                            'enable_internal_market_data_service',
+                        }
+
+                        if key in int_keys:
                             config[key] = int(value)
-                        # Float fields
-                        elif key in ['daily_max_loss', 'initial_stoploss', 'max_loss_per_trade', 'trail_start_profit', 'trail_step', 'target_points', 'risk_per_trade', 'supertrend_multiplier']:
+                        elif key in float_keys:
                             config[key] = float(value)
-                        # Boolean fields
-                        elif key in ['trade_only_on_flip', 'trading_enabled', 'htf_filter_enabled', 'macd_confirmation_enabled', 'bypass_market_hours']:
-                            config[key] = value.lower() in ('true', '1', 'yes')
+                        elif key in bool_keys:
+                            config[key] = str(value).lower() in ('true', '1', 'yes', 'y', 'on')
                         else:
                             config[key] = value
     except Exception as e:
         logger.error(f"Error loading config: {e}")
+
+
+async def _prune_table_to_last_n(db: aiosqlite.Connection, table: str, max_rows: int) -> int:
+    """Keep only the last N rows by id; returns deleted row count."""
+    max_rows = int(max_rows)
+    if max_rows <= 0:
+        return 0
+
+    cur = await db.execute(f"SELECT COUNT(1) FROM {table}")
+    count_row = await cur.fetchone()
+    total = int(count_row[0] or 0) if count_row else 0
+    if total <= max_rows:
+        return 0
+
+    # Delete everything older than the Nth latest id.
+    cur = await db.execute(
+        f"SELECT id FROM {table} ORDER BY id DESC LIMIT 1 OFFSET ?",
+        (max_rows - 1,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return 0
+    cutoff_id = int(row[0])
+    cur = await db.execute(f"DELETE FROM {table} WHERE id < ?", (cutoff_id,))
+    return int(cur.rowcount or 0)
+
+
+async def prune_backend_market_data(*, vacuum: bool | None = None) -> dict:
+    """Prune backend SQLite tick/candle tables to keep DB small.
+
+    Behavior:
+    - If store_* is False and max_*_rows == 0: delete all rows from that table.
+    - If store_* is True and max_*_rows > 0: keep last N rows.
+    """
+    vacuum = config.get('vacuum_db_on_prune', True) if vacuum is None else bool(vacuum)
+    deleted_candles = 0
+    deleted_ticks = 0
+    pruned = False
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            store_candles = bool(config.get('store_candle_data', False))
+            store_ticks = bool(config.get('store_tick_data', False))
+
+            max_candles = int(config.get('max_candle_rows', 0) or 0)
+            max_ticks = int(config.get('max_tick_rows', 0) or 0)
+
+            if not store_candles and max_candles == 0:
+                cur = await db.execute("DELETE FROM candle_data")
+                deleted_candles = int(cur.rowcount or 0)
+                pruned = pruned or deleted_candles > 0
+            elif store_candles and max_candles > 0:
+                deleted_candles = await _prune_table_to_last_n(db, "candle_data", max_candles)
+                pruned = pruned or deleted_candles > 0
+
+            if not store_ticks and max_ticks == 0:
+                cur = await db.execute("DELETE FROM tick_data")
+                deleted_ticks = int(cur.rowcount or 0)
+                pruned = pruned or deleted_ticks > 0
+            elif store_ticks and max_ticks > 0:
+                deleted_ticks = await _prune_table_to_last_n(db, "tick_data", max_ticks)
+                pruned = pruned or deleted_ticks > 0
+
+            await db.commit()
+
+            if pruned and vacuum:
+                try:
+                    await db.execute("VACUUM")
+                    await db.commit()
+                except Exception as e:
+                    logger.warning(f"[DB] VACUUM failed: {e}")
+
+    except Exception as e:
+        logger.error(f"[DB] Prune error: {e}")
+
+    return {
+        "deleted_candles": deleted_candles,
+        "deleted_ticks": deleted_ticks,
+        "vacuum": bool(vacuum),
+    }
 
 async def save_config():
     """Save config to database"""
@@ -564,6 +703,8 @@ async def save_candle_data(
 ):
     """Save candle data for analysis"""
     try:
+        if not bool(config.get('store_candle_data', False)):
+            return
         from datetime import datetime, timezone
         timestamp = datetime.now(timezone.utc).isoformat()
         
@@ -587,6 +728,14 @@ async def save_candle_data(
                 )
             )
             await db.commit()
+            # Optional retention
+            max_rows = int(config.get('max_candle_rows', 0) or 0)
+            if max_rows > 0:
+                try:
+                    await _prune_table_to_last_n(db, "candle_data", max_rows)
+                    await db.commit()
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"[DB] Error saving candle data: {e}")
 
@@ -600,6 +749,8 @@ async def save_tick_data(
 ):
     """Persist raw tick data (index + optional option LTP) for later analysis/replay."""
     try:
+        if not bool(config.get('store_tick_data', False)):
+            return
         ts = str(timestamp or _utc_now_iso())
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
@@ -615,6 +766,13 @@ async def save_tick_data(
                 ),
             )
             await db.commit()
+            max_rows = int(config.get('max_tick_rows', 0) or 0)
+            if max_rows > 0:
+                try:
+                    await _prune_table_to_last_n(db, "tick_data", max_rows)
+                    await db.commit()
+                except Exception:
+                    pass
     except Exception as e:
         logger.error(f"[DB] Error saving tick data: {e}")
 

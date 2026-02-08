@@ -48,6 +48,33 @@ bot_state = {
 }
 
 # Configuration (can be updated from frontend)
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
 config = {
     "dhan_access_token": "",
     "dhan_client_id": "",
@@ -62,11 +89,35 @@ config = {
     # Profit Taking
     "target_points": 0,  # Target profit points (0 = disabled)
 
-    # Market data persistence
-    "store_tick_data": True,  # Persist index/option ticks to DB
+    # Market data source
+    # - 'mds'  : consume candles from the separate market-data-service (recommended for docker)
+    # - 'dhan' : fetch quotes directly via Dhan SDK
+    "market_data_provider": (
+        (os.getenv("MARKET_DATA_PROVIDER") or "").strip().lower()
+        or ("mds" if os.getenv("MDS_BASE_URL") else "dhan")
+    ),
+    "mds_base_url": (os.getenv("MDS_BASE_URL", "") or "").strip(),  # e.g. http://market-data-service:8002/v1
+    "mds_poll_seconds": _env_float("MDS_POLL_SECONDS", 1.0),
+
+    # Market data persistence (backend SQLite)
+    # Keep these off by default to prevent the backend DB from growing indefinitely.
+    "store_tick_data": _env_bool("STORE_TICK_DATA", False),  # Persist index/option ticks to DB
+    "store_candle_data": _env_bool("STORE_CANDLE_DATA", False),  # Persist derived candles/indicator telemetry to DB
     "market_data_poll_seconds": 1.0,  # Quote polling interval
     "tick_persist_interval_seconds": 1.0,  # DB write interval (throttle)
     "pause_market_data_when_closed": False,
+
+    # DB retention (applies only to backend SQLite tables)
+    "prune_db_on_startup": _env_bool("PRUNE_DB_ON_STARTUP", True),
+    "max_candle_rows": _env_int("MAX_CANDLE_ROWS", 0),  # 0 = delete all if store_candle_data is False; else keep last N rows
+    "max_tick_rows": _env_int("MAX_TICK_ROWS", 0),  # 0 = delete all if store_tick_data is False; else keep last N rows
+    "vacuum_db_on_prune": _env_bool("VACUUM_DB_ON_PRUNE", True),
+
+    # Internal backend tick collector (legacy). Prefer market-data-service instead.
+    "enable_internal_market_data_service": _env_bool("ENABLE_INTERNAL_MARKET_DATA_SERVICE", False),
+
+    # UI feed: keep index LTP updating even when bot is stopped (consume-only, no DB writes)
+    "enable_mds_consumer": _env_bool("ENABLE_MDS_CONSUMER", True),
 
     # Paper replay (use recorded DB candles instead of synthetic)
     "paper_replay_enabled": False,
@@ -83,6 +134,13 @@ config = {
     "macd_slow": 26,
     "macd_signal": 9,
     "macd_confirmation_enabled": True,
+
+    # ScoreEngine (score_mds) bonus scoring knobs
+    # These add small conviction bonuses on top of base MACD/HIST/ST scoring.
+    # Set to 0 to disable.
+    "mds_bonus_macd_triple": 1.0,     # MACD line + signal line + histogram all same sign
+    "mds_bonus_macd_momentum": 0.5,   # MACD score + HIST score both strong and aligned
+    "mds_bonus_macd_cross": 0.5,      # MACD cross event bonus
     "candle_interval": 5,  # seconds (default 5s)
     "selected_index": "NIFTY",  # Default index
     # Trade protection settings

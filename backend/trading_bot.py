@@ -45,7 +45,286 @@ class TradingBot:
         self._paper_replay_candles = []
         self._paper_replay_pos = 0
         self._paper_replay_htf_elapsed = 0
+        self._last_mds_candle_ts = None
+        self._mds_htf_count = 0
+        self._mds_htf_high = 0.0
+        self._mds_htf_low = float('inf')
+        self._mds_htf_close = 0.0
         self._initialize_indicator()
+
+    def _prefetch_candles_needed(self) -> int:
+        st_period = int(config.get('supertrend_period', 7) or 7)
+        macd_slow = int(config.get('macd_slow', 26) or 26)
+        macd_signal = int(config.get('macd_signal', 9) or 9)
+
+        # SuperTrend needs at least `period` candles; MACD needs slow EMA + signal EMA.
+        base_needed = max(st_period + 1, macd_slow + macd_signal)
+
+        # If HTF filter is enabled (fixed to 60s in current code), seed enough candles
+        # so 1m SuperTrend is also ready.
+        interval = int(config.get('candle_interval', 5) or 5)
+        if bool(config.get('htf_filter_enabled', True)) and interval < 60 and (60 % max(1, interval) == 0):
+            multiple_1m = 60 // max(1, interval)
+            base_needed = max(base_needed, multiple_1m * (st_period + 1))
+
+        # If score engine is selected, ensure both base TF and next TF are ready.
+        if str(config.get('indicator_type', 'supertrend') or 'supertrend').strip().lower() == 'score_mds':
+            try:
+                base_tf = int(config.get('candle_interval', 5) or 5)
+                if base_tf in ScoreEngine._TF_CHAIN:
+                    chain = list(ScoreEngine._TF_CHAIN)
+                    next_tf = chain[chain.index(base_tf) + 1]
+                    multiple = int(next_tf) // max(1, base_tf)
+                    next_tf_needed = max(st_period + 1, macd_slow + macd_signal)
+                    base_needed = max(base_needed, multiple * next_tf_needed)
+            except Exception:
+                pass
+
+        # Small safety cushion for flip/slope computations.
+        return int(max(50, base_needed + 5))
+
+    async def _seed_indicators_from_mds_history(self) -> None:
+        if str(config.get('market_data_provider', 'dhan') or 'dhan').strip().lower() != 'mds':
+            return
+        if not bool(config.get('prefetch_candles_on_start', True)):
+            return
+
+        base_url = str(config.get('mds_base_url', '') or '').strip()
+        if not base_url:
+            return
+
+        index_name = str(config.get('selected_index', 'NIFTY') or 'NIFTY').strip().upper()
+        interval = int(config.get('candle_interval', 5) or 5)
+        limit = self._prefetch_candles_needed()
+
+        try:
+            from mds_client import fetch_last_candles
+
+            candles = await fetch_last_candles(
+                base_url=base_url,
+                symbol=index_name,
+                timeframe_seconds=interval,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.warning(f"[WARMUP] Prefetch failed (MDS): {e}")
+            return
+
+        if not candles:
+            logger.info("[WARMUP] No candles returned from MDS (skipping seed)")
+            return
+
+        # Reset any MDS-derived HTF aggregation state
+        self._mds_htf_count = 0
+        self._mds_htf_high = 0.0
+        self._mds_htf_low = float('inf')
+        self._mds_htf_close = 0.0
+
+        multiple_1m = None
+        if bool(config.get('htf_filter_enabled', True)) and interval < 60 and (60 % max(1, interval) == 0):
+            multiple_1m = 60 // max(1, interval)
+
+        last_indicator_value = None
+        last_signal = None
+        last_mds = None
+
+        for row in candles:
+            if not isinstance(row, dict):
+                continue
+            try:
+                high = float(row.get('high') or 0.0)
+                low = float(row.get('low') or float('inf'))
+                close = float(row.get('close') or 0.0)
+            except Exception:
+                continue
+
+            if close <= 0 or high <= 0 or low == float('inf'):
+                continue
+
+            last_indicator_value, last_signal = self.indicator.add_candle(high, low, close)
+            if self.macd:
+                self.macd.add_candle(high, low, close)
+
+            if str(config.get('indicator_type') or '').strip().lower() == 'score_mds' and self.score_engine:
+                try:
+                    last_mds = self.score_engine.on_base_candle(Candle(high=high, low=low, close=close))
+                except Exception:
+                    last_mds = None
+
+            if multiple_1m:
+                self._mds_htf_count += 1
+                self._mds_htf_high = max(self._mds_htf_high, high)
+                self._mds_htf_low = min(self._mds_htf_low, low)
+                self._mds_htf_close = close
+
+                if self._mds_htf_count >= multiple_1m:
+                    htf_value, htf_signal = self.htf_indicator.add_candle(
+                        self._mds_htf_high, self._mds_htf_low, self._mds_htf_close
+                    )
+                    if htf_value:
+                        bot_state['htf_supertrend_value'] = htf_value if isinstance(htf_value, (int, float)) else str(htf_value)
+                        if htf_signal == 'GREEN':
+                            bot_state['htf_signal_status'] = 'buy'
+                        elif htf_signal == 'RED':
+                            bot_state['htf_signal_status'] = 'sell'
+                        else:
+                            bot_state['htf_signal_status'] = 'waiting'
+                        if htf_signal:
+                            bot_state['htf_supertrend_signal'] = htf_signal
+
+                    self._mds_htf_count = 0
+                    self._mds_htf_high = 0.0
+                    self._mds_htf_low = float('inf')
+                    self._mds_htf_close = 0.0
+
+        # Publish last computed values to state so UI doesn't show "waiting" on startup.
+        if last_indicator_value:
+            bot_state['supertrend_value'] = last_indicator_value if isinstance(last_indicator_value, (int, float)) else str(last_indicator_value)
+            if last_signal == 'GREEN':
+                bot_state['signal_status'] = 'buy'
+            elif last_signal == 'RED':
+                bot_state['signal_status'] = 'sell'
+            else:
+                bot_state['signal_status'] = 'waiting'
+            if last_signal:
+                bot_state['last_supertrend_signal'] = last_signal
+
+        if self.macd and self.macd.last_macd is not None:
+            bot_state['macd_value'] = float(self.macd.last_macd)
+
+        if last_mds is not None:
+            bot_state['mds_score'] = float(last_mds.score)
+            bot_state['mds_slope'] = float(last_mds.slope)
+            bot_state['mds_acceleration'] = float(last_mds.acceleration)
+            bot_state['mds_stability'] = float(last_mds.stability)
+            bot_state['mds_confidence'] = float(last_mds.confidence)
+            bot_state['mds_is_choppy'] = bool(last_mds.is_choppy)
+            bot_state['mds_direction'] = str(last_mds.direction)
+
+        # Prevent immediate re-processing of the last candle on first poll.
+        try:
+            self._last_mds_candle_ts = str((candles[-1] or {}).get('ts') or '') or None
+        except Exception:
+            self._last_mds_candle_ts = None
+
+        logger.info(f"[WARMUP] Seeded indicators from MDS history | Candles={len(candles)} Interval={interval}s")
+
+    async def _handle_closed_candle(
+        self,
+        *,
+        index_name: str,
+        candle_number: int,
+        candle_interval: int,
+        high: float,
+        low: float,
+        close: float,
+        current_candle_time: datetime,
+    ) -> None:
+        if not (high > 0 and low < float('inf') and close > 0):
+            return
+
+        indicator_value, signal = self.indicator.add_candle(high, low, close)
+        macd_value = 0.0
+        if self.macd:
+            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
+            if macd_line is not None:
+                macd_value = float(macd_line)
+
+        mds_snapshot = None
+        if config.get('indicator_type') == 'score_mds' and self.score_engine:
+            try:
+                mds_snapshot = self.score_engine.on_base_candle(Candle(high=float(high), low=float(low), close=float(close)))
+
+                bot_state['mds_score'] = float(mds_snapshot.score)
+                bot_state['mds_slope'] = float(mds_snapshot.slope)
+                bot_state['mds_acceleration'] = float(mds_snapshot.acceleration)
+                bot_state['mds_stability'] = float(mds_snapshot.stability)
+                bot_state['mds_confidence'] = float(mds_snapshot.confidence)
+                bot_state['mds_is_choppy'] = bool(mds_snapshot.is_choppy)
+                bot_state['mds_direction'] = str(mds_snapshot.direction)
+            except Exception as e:
+                logger.error(f"[MDS] ScoreEngine update failed: {e}", exc_info=True)
+                mds_snapshot = None
+
+        # Update state if indicator is ready
+        if indicator_value:
+            bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
+        if self.macd and self.macd.last_macd is not None:
+            bot_state['macd_value'] = float(self.macd.last_macd)
+        else:
+            bot_state['macd_value'] = macd_value
+
+        # Update signal status (GREEN="buy", RED="sell", None="waiting")
+        if signal == "GREEN":
+            bot_state['signal_status'] = "buy"
+        elif signal == "RED":
+            bot_state['signal_status'] = "sell"
+        else:
+            bot_state['signal_status'] = "waiting"
+
+        # Always log candle close (even while indicators warm up)
+        st_txt = f"{indicator_value:.2f}" if isinstance(indicator_value, (int, float)) else "NA"
+        macd_txt = f"{macd_value:.4f}" if isinstance(macd_value, (int, float)) else "NA"
+        signal_txt = signal if signal else "NONE"
+        logger.info(
+            f"[CANDLE CLOSE #{candle_number}] {index_name} | "
+            f"H={high:.2f} L={low:.2f} C={close:.2f} | "
+            f"ST={st_txt} | MACD={macd_txt} | Signal={signal_txt}"
+        )
+
+        # Save candle data for analysis (optional; disabled by default to keep DB small)
+        if indicator_value and config.get('store_candle_data', False):
+            from database import save_candle_data
+
+            await save_candle_data(
+                candle_number=candle_number,
+                index_name=index_name,
+                high=high,
+                low=low,
+                close=close,
+                supertrend_value=indicator_value,
+                macd_value=macd_value,
+                signal_status=bot_state['signal_status'],
+                interval_seconds=int(config.get('candle_interval', candle_interval) or candle_interval),
+            )
+
+        # Candle-close trailing SL/target check regardless of signal readiness
+        if self.current_position:
+            option_ltp = bot_state['current_option_ltp']
+            sl_hit = await self.check_trailing_sl_on_close(option_ltp)
+            if sl_hit:
+                self.last_exit_candle_time = current_candle_time
+
+        # Score-engine trading path (independent of SuperTrend signal emission)
+        if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
+            can_trade = True
+            if self.last_exit_candle_time:
+                time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
+                if time_since_exit < candle_interval:
+                    can_trade = False
+            if can_trade:
+                exited = await self.process_mds_on_close(mds_snapshot, close)
+                if exited:
+                    self.last_exit_candle_time = current_candle_time
+        else:
+            prev_signal = bot_state.get('last_supertrend_signal')
+            flipped = bool(signal) and (prev_signal is None or signal != prev_signal)
+            if signal:
+                bot_state['last_supertrend_signal'] = signal
+
+            # Trading logic - entries/exits based on SuperTrend signal
+            can_trade = True
+            if self.last_exit_candle_time:
+                time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
+                if time_since_exit < candle_interval:
+                    can_trade = False
+
+            if not can_trade:
+                logger.info("[ENTRY_DECISION] NO | Reason=recent_exit_cooldown")
+            else:
+                exited = await self.process_signal_on_close(str(signal or ''), close, flipped=bool(flipped))
+                if exited:
+                    self.last_exit_candle_time = current_candle_time
 
     def _can_place_new_entry_order(self) -> bool:
         cooldown = int(config.get('min_order_cooldown_seconds', 0) or 0)
@@ -85,22 +364,43 @@ class TradingBot:
     async def _init_paper_replay(self) -> None:
         """Load candle data from DB for after-hours paper replay."""
         try:
-            from database import get_candle_data_for_replay
-
             index_name = config.get('selected_index', 'NIFTY')
             interval = int(config.get('candle_interval', 5) or 5)
             date_ist = str(config.get('paper_replay_date_ist', '') or '').strip() or None
 
-            candles = await get_candle_data_for_replay(
-                index_name=index_name,
-                interval_seconds=interval,
-                date_ist=date_ist,
-                limit=20000,
-            )
+            provider = str(config.get('market_data_provider', 'dhan') or 'dhan').strip().lower()
+            base_url = str(config.get('mds_base_url', '') or '').strip()
+
+            candles = []
+            if provider == 'mds' and base_url and date_ist:
+                # Consume-only replay: pull historical candles for the selected IST date
+                # from market-data-service (TimescaleDB) and replay them locally.
+                from mds_client import fetch_candles_for_ist_date
+
+                candles = await fetch_candles_for_ist_date(
+                    base_url=base_url,
+                    symbol=index_name,
+                    timeframe_seconds=interval,
+                    date_ist=date_ist,
+                    limit=200000,
+                )
+            else:
+                # Legacy fallback: backend SQLite candle_data table (may be empty in consume-only setups)
+                from database import get_candle_data_for_replay
+
+                candles = await get_candle_data_for_replay(
+                    index_name=index_name,
+                    interval_seconds=interval,
+                    date_ist=date_ist,
+                    limit=20000,
+                )
+
             self._paper_replay_candles = candles or []
             self._paper_replay_pos = 0
             self._paper_replay_htf_elapsed = 0
-            logger.info(f"[REPLAY] Loaded {len(self._paper_replay_candles)} candles | Index={index_name} Interval={interval}s DateIST={date_ist or 'latest'}")
+
+            src = "MDS" if (provider == 'mds' and base_url and date_ist) else "SQLITE"
+            logger.info(f"[REPLAY] Loaded {len(self._paper_replay_candles)} candles | Source={src} | Index={index_name} Interval={interval}s DateIST={date_ist or 'latest'}")
         except Exception as e:
             self._paper_replay_candles = []
             self._paper_replay_pos = 0
@@ -133,6 +433,9 @@ class TradingBot:
                 macd_slow=int(config.get('macd_slow', 26)),
                 macd_signal=int(config.get('macd_signal', 9)),
                 base_timeframe_seconds=int(config.get('candle_interval', 5) or 5),
+                bonus_macd_triple=float(config.get('mds_bonus_macd_triple', 1.0) or 0.0),
+                bonus_macd_momentum=float(config.get('mds_bonus_macd_momentum', 0.5) or 0.0),
+                bonus_macd_cross=float(config.get('mds_bonus_macd_cross', 0.5) or 0.0),
             )
             logger.info(f"[SIGNAL] SuperTrend initialized")
         except Exception as e:
@@ -141,7 +444,17 @@ class TradingBot:
             self.indicator = SuperTrend(period=7, multiplier=4)
             self.htf_indicator = SuperTrend(period=7, multiplier=4)
             self.macd = MACD(fast=12, slow=26, signal=9)
-            self.score_engine = ScoreEngine(st_period=7, st_multiplier=4, macd_fast=12, macd_slow=26, macd_signal=9, base_timeframe_seconds=int(config.get('candle_interval', 5) or 5))
+            self.score_engine = ScoreEngine(
+                st_period=7,
+                st_multiplier=4,
+                macd_fast=12,
+                macd_slow=26,
+                macd_signal=9,
+                base_timeframe_seconds=int(config.get('candle_interval', 5) or 5),
+                bonus_macd_triple=float(config.get('mds_bonus_macd_triple', 1.0) or 0.0),
+                bonus_macd_momentum=float(config.get('mds_bonus_macd_momentum', 0.5) or 0.0),
+                bonus_macd_cross=float(config.get('mds_bonus_macd_cross', 0.5) or 0.0),
+            )
             logger.info(f"[SIGNAL] SuperTrend (fallback) initialized")
     
     def reset_indicator(self):
@@ -164,12 +477,20 @@ class TradingBot:
                     macd_slow=int(config.get('macd_slow', 26)),
                     macd_signal=int(config.get('macd_signal', 9)),
                     base_timeframe_seconds=int(config.get('candle_interval', 5) or 5),
+                    bonus_macd_triple=float(config.get('mds_bonus_macd_triple', 1.0) or 0.0),
+                    bonus_macd_momentum=float(config.get('mds_bonus_macd_momentum', 0.5) or 0.0),
+                    bonus_macd_cross=float(config.get('mds_bonus_macd_cross', 0.5) or 0.0),
                 )
             except Exception:
                 self.score_engine = None
 
         self._mds_last_direction = None
         self._mds_confirm_count = 0
+        self._last_mds_candle_ts = None
+        self._mds_htf_count = 0
+        self._mds_htf_high = 0.0
+        self._mds_htf_low = float('inf')
+        self._mds_htf_close = 0.0
         logger.info(f"[SIGNAL] Indicator reset: {config.get('indicator_type', 'supertrend')}")
     
     def is_within_trading_hours(self) -> bool:
@@ -212,16 +533,30 @@ class TradingBot:
             if not self.initialize_dhan():
                 return {"status": "error", "message": "Dhan API not available (credentials/SDK)"}
 
-        # Prepare replay candles for after-hours paper simulation
-        if bot_state.get('mode') == 'paper' and config.get('paper_replay_enabled', False):
+        # Prepare replay candles for after-hours (or bypass-hours) paper simulation
+        replay_enabled = bool(bot_state.get('mode') == 'paper' and config.get('paper_replay_enabled', False))
+        if replay_enabled:
             await self._init_paper_replay()
             if not self._paper_replay_candles:
-                return {"status": "error", "message": "Paper replay enabled but no candles found in DB"}
+                return {"status": "error", "message": "Paper replay enabled but no candles found (MDS/DB)"}
         
         self.running = True
         bot_state['is_running'] = True
         self.reset_indicator()
         self.last_signal = None
+
+        # Do not seed from "latest" history when running a dated replay.
+        # Also skip MDS prefetch when running synthetic-only paper testing.
+        synthetic_only = (
+            bot_state.get('mode') == 'paper'
+            and bool(config.get('bypass_market_hours', False))
+            and not bool(config.get('paper_replay_enabled', False))
+        )
+        if (not replay_enabled) and (not synthetic_only):
+            # Prefetch and seed indicators from Timescale via market-data-service so we don't
+            # spend the first N candles "warming up" after each restart.
+            await self._seed_indicators_from_mds_history()
+
         self.task = asyncio.create_task(self.run_loop())
         
         index_name = config['selected_index']
@@ -582,7 +917,130 @@ class TradingBot:
                     continue
 
                 # Fetch market data (skip if MarketDataService is active)
-                if self.dhan and not bot_state.get('market_data_service_active', False):
+                provider = str(config.get('market_data_provider', 'dhan') or 'dhan').strip().lower()
+
+                # In paper mode, when bypass_market_hours is enabled and paper replay is OFF,
+                # run fully synthetic candles even if docker env defaults provider to 'mds'.
+                # This enables strategy testing outside market hours.
+                if (
+                    bot_state.get('mode') == 'paper'
+                    and bool(config.get('bypass_market_hours', False))
+                    and not replay_enabled
+                ):
+                    provider = 'synthetic'
+
+                mds_new_candle = None
+                mds_new_candle_ts = None
+
+                # Prefer consuming candles from market-data-service (Timescale-backed)
+                if provider == 'mds':
+                    try:
+                        from mds_client import fetch_latest_candle
+
+                        base_url = str(config.get('mds_base_url', '') or '').strip()
+                        poll_s = float(config.get('mds_poll_seconds', 1.0) or 1.0)
+                        candle = await fetch_latest_candle(
+                            base_url=base_url,
+                            symbol=index_name,
+                            timeframe_seconds=int(config.get('candle_interval', candle_interval) or candle_interval),
+                            min_poll_seconds=poll_s,
+                        )
+                        if isinstance(candle, dict) and (candle.get('close') is not None):
+                            try:
+                                close_price = float(candle.get('close') or 0.0)
+                            except Exception:
+                                close_price = 0.0
+
+                            if close_price > 0:
+                                bot_state['index_ltp'] = float(close_price)
+
+                                mds_new_candle_ts = str(candle.get('ts') or '') or None
+                                if mds_new_candle_ts and mds_new_candle_ts != self._last_mds_candle_ts:
+                                    mds_new_candle = candle
+                                    self._last_mds_candle_ts = mds_new_candle_ts
+                        elif self.dhan:
+                            # If MDS has no candles yet, fall back to direct quote.
+                            try:
+                                index_ltp = await asyncio.to_thread(self.dhan.get_index_ltp, index_name)
+                                if index_ltp and index_ltp > 0:
+                                    bot_state['index_ltp'] = float(index_ltp)
+                            except Exception:
+                                pass
+                    except Exception:
+                        # If MDS is unavailable, fall back to any other provider.
+                        pass
+
+                    # Option LTP is only needed when a real position is open.
+                    # MDS currently does not expose option quotes, so we use Dhan (if configured) in that case.
+                    if self.dhan and self.current_position is not None:
+                        security_id = self.current_position.get('security_id', '')
+                        if security_id and not security_id.startswith('SIM_'):
+                            try:
+                                option_security_id = int(security_id)
+                                _index_ltp, option_ltp = await asyncio.to_thread(
+                                    self.dhan.get_index_and_option_ltp, index_name, option_security_id
+                                )
+                                if option_ltp and option_ltp > 0:
+                                    option_ltp = round(option_ltp / 0.05) * 0.05
+                                    bot_state['current_option_ltp'] = round(option_ltp, 2)
+                            except Exception:
+                                pass
+
+                    # If we received a new candle from MDS, process it as the authoritative candle close.
+                    if isinstance(mds_new_candle, dict):
+                        try:
+                            high = float(mds_new_candle.get('high') or 0.0)
+                            low = float(mds_new_candle.get('low') or float('inf'))
+                            close = float(mds_new_candle.get('close') or 0.0)
+                        except Exception:
+                            high, low, close = 0.0, float('inf'), 0.0
+
+                        # Update HTF aggregation from base candles (fixed to 60s in current code).
+                        interval = int(config.get('candle_interval', candle_interval) or candle_interval)
+                        if bool(config.get('htf_filter_enabled', True)) and interval < 60 and (60 % max(1, interval) == 0) and close > 0:
+                            multiple_1m = 60 // max(1, interval)
+                            self._mds_htf_count += 1
+                            self._mds_htf_high = max(self._mds_htf_high, high)
+                            self._mds_htf_low = min(self._mds_htf_low, low)
+                            self._mds_htf_close = close
+                            if self._mds_htf_count >= multiple_1m:
+                                htf_candle_number += 1
+                                if self._mds_htf_high > 0 and self._mds_htf_low < float('inf'):
+                                    htf_value, htf_signal = self.htf_indicator.add_candle(
+                                        self._mds_htf_high, self._mds_htf_low, self._mds_htf_close
+                                    )
+                                    if htf_value:
+                                        bot_state['htf_supertrend_value'] = htf_value if isinstance(htf_value, (int, float)) else str(htf_value)
+                                        if htf_signal == 'GREEN':
+                                            bot_state['htf_signal_status'] = 'buy'
+                                        elif htf_signal == 'RED':
+                                            bot_state['htf_signal_status'] = 'sell'
+                                        else:
+                                            bot_state['htf_signal_status'] = 'waiting'
+                                        if htf_signal:
+                                            bot_state['htf_supertrend_signal'] = htf_signal
+
+                                self._mds_htf_count = 0
+                                self._mds_htf_high = 0.0
+                                self._mds_htf_low = float('inf')
+                                self._mds_htf_close = 0.0
+
+                        # Only advance candle number / trading decisions when the candle is valid.
+                        if high > 0 and low < float('inf') and close > 0:
+                            current_candle_time = datetime.now()
+                            candle_number += 1
+                            await self._handle_closed_candle(
+                                index_name=index_name,
+                                candle_number=candle_number,
+                                candle_interval=int(config.get('candle_interval', candle_interval) or candle_interval),
+                                high=high,
+                                low=low,
+                                close=close,
+                                current_candle_time=current_candle_time,
+                            )
+
+                # Legacy mode: fetch quotes directly via Dhan
+                elif self.dhan and not bot_state.get('market_data_service_active', False):
                     has_position = self.current_position is not None
                     option_security_id = None
                     
@@ -632,7 +1090,7 @@ class TradingBot:
                 
                 # Update candle data
                 index_ltp = bot_state['index_ltp']
-                if index_ltp > 0:
+                if provider != 'mds' and index_ltp > 0:
                     if index_ltp > high:
                         high = index_ltp
                     if index_ltp < low:
@@ -648,7 +1106,7 @@ class TradingBot:
                         htf_close = index_ltp
 
                 # Check if HTF candle is complete
-                if config.get('htf_filter_enabled', True) and config.get('candle_interval', 60) < 60:
+                if provider != 'mds' and config.get('htf_filter_enabled', True) and config.get('candle_interval', 60) < 60:
                     htf_seconds = int(config.get('htf_filter_timeframe', 60))
                     if htf_seconds != 60:
                         htf_seconds = 60
@@ -696,109 +1154,20 @@ class TradingBot:
                 
                 # Check if candle is complete
                 elapsed = (datetime.now() - candle_start_time).total_seconds()
-                if elapsed >= candle_interval:
+                if provider != 'mds' and elapsed >= candle_interval:
                     current_candle_time = datetime.now()
                     candle_number += 1
-                    
-                    if high > 0 and low < float('inf'):
-                        indicator_value, signal = self.indicator.add_candle(high, low, close)
-                        macd_value = 0.0
-                        if self.macd:
-                            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
-                            if macd_line is not None:
-                                macd_value = float(macd_line)
 
-                        mds_snapshot = None
-                        if config.get('indicator_type') == 'score_mds' and self.score_engine:
-                            try:
-                                mds_snapshot = self.score_engine.on_base_candle(Candle(high=float(high), low=float(low), close=float(close)))
+                    await self._handle_closed_candle(
+                        index_name=index_name,
+                        candle_number=candle_number,
+                        candle_interval=int(config.get('candle_interval', candle_interval) or candle_interval),
+                        high=high,
+                        low=low,
+                        close=close,
+                        current_candle_time=current_candle_time,
+                    )
 
-                                bot_state['mds_score'] = float(mds_snapshot.score)
-                                bot_state['mds_slope'] = float(mds_snapshot.slope)
-                                bot_state['mds_acceleration'] = float(mds_snapshot.acceleration)
-                                bot_state['mds_stability'] = float(mds_snapshot.stability)
-                                bot_state['mds_confidence'] = float(mds_snapshot.confidence)
-                                bot_state['mds_is_choppy'] = bool(mds_snapshot.is_choppy)
-                                bot_state['mds_direction'] = str(mds_snapshot.direction)
-                            except Exception as e:
-                                logger.error(f"[MDS] ScoreEngine update failed: {e}", exc_info=True)
-                                mds_snapshot = None
-                        
-                        # Always update SuperTrend value
-                        if indicator_value:
-                            bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
-                            bot_state['macd_value'] = macd_value
-                            
-                            # Update signal status (GREEN="buy", RED="sell", None="waiting")
-                            if signal == "GREEN":
-                                bot_state['signal_status'] = "buy"
-                            elif signal == "RED":
-                                bot_state['signal_status'] = "sell"
-                            else:
-                                bot_state['signal_status'] = "waiting"
-                            
-                            # Always log candle close with indicator values
-                            if signal:
-                                signal_status = f"Signal={signal}"
-                            else:
-                                signal_status = "No signal yet"
-                            logger.info(
-                                f"[CANDLE CLOSE #{candle_number}] {index_name} | "
-                                f"H={high:.2f} L={low:.2f} C={close:.2f} | "
-                                f"ST={indicator_value:.2f} | MACD={macd_value:.4f} | "
-                                f"{signal_status}"
-                            )
-                            
-                            # Save candle data for analysis
-                            from database import save_candle_data
-                            await save_candle_data(
-                                candle_number=candle_number,
-                                index_name=index_name,
-                                high=high,
-                                low=low,
-                                close=close,
-                                supertrend_value=indicator_value,
-                                macd_value=macd_value,
-                                signal_status=bot_state['signal_status'],
-                                interval_seconds=int(config.get('candle_interval', candle_interval) or candle_interval),
-                            )
-
-                        # Candle-close trailing SL/target check regardless of signal readiness
-                        if self.current_position:
-                            option_ltp = bot_state['current_option_ltp']
-                            sl_hit = await self.check_trailing_sl_on_close(option_ltp)
-                            if sl_hit:
-                                self.last_exit_candle_time = current_candle_time
-
-                        # Score-engine trading path (independent of SuperTrend signal emission)
-                        if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
-                            can_trade = True
-                            if self.last_exit_candle_time:
-                                time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
-                                if time_since_exit < candle_interval:
-                                    can_trade = False
-                            if can_trade:
-                                exited = await self.process_mds_on_close(mds_snapshot, close)
-                                if exited:
-                                    self.last_exit_candle_time = current_candle_time
-                        else:
-                            if signal:
-                                prev_signal = bot_state.get('last_supertrend_signal')
-                                flipped = prev_signal is None or signal != prev_signal
-                                bot_state['last_supertrend_signal'] = signal
-
-                                # Trading logic - entries/exits based on SuperTrend signal
-                                can_trade = True
-                                if self.last_exit_candle_time:
-                                    time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
-                                    if time_since_exit < candle_interval:
-                                        can_trade = False
-
-                                if can_trade:
-                                    exited = await self.process_signal_on_close(signal, close, flipped=flipped)
-                                    if exited:
-                                        self.last_exit_candle_time = current_candle_time
-                    
                     # Reset candle for next period
                     candle_start_time = datetime.now()
                     high, low, close = 0, float('inf'), 0
@@ -903,6 +1272,18 @@ class TradingBot:
             score = float(getattr(mds_snapshot, 'score', 0.0) or 0.0)
             slope = float(getattr(mds_snapshot, 'slope', 0.0) or 0.0)
 
+            # Use slow timeframe MACD+Histogram as a confirmation signal for exits.
+            # This reduces churn exits caused by base-TF noise.
+            slow_mom = 0.0
+            try:
+                tf_scores = getattr(mds_snapshot, 'tf_scores', {}) or {}
+                if isinstance(tf_scores, dict) and tf_scores:
+                    slow_tf = max(int(k) for k in tf_scores.keys())
+                    slow = tf_scores.get(slow_tf)
+                    slow_mom = float(getattr(slow, 'macd_score', 0.0) or 0.0) + float(getattr(slow, 'hist_score', 0.0) or 0.0)
+            except Exception:
+                slow_mom = 0.0
+
             # Deterministic exits (score-only)
             neutral = abs(score) <= 6.0
 
@@ -910,29 +1291,35 @@ class TradingBot:
             reason = ""
             if position_type == 'CE':
                 if score <= -10.0:
-                    should_exit = True
-                    reason = "MDS Reversal"
+                    if slow_mom <= -1.0:
+                        should_exit = True
+                        reason = "MDS Reversal (slow confirm)"
                 elif neutral:
-                    should_exit = True
-                    reason = "MDS Neutral"
+                    if abs(slow_mom) <= 1.0:
+                        should_exit = True
+                        reason = "MDS Neutral (slow confirm)"
                 elif slope <= -2.0 and score < 12.0:
-                    should_exit = True
-                    reason = "MDS Momentum Loss"
+                    if slow_mom <= 0.0:
+                        should_exit = True
+                        reason = "MDS Momentum Loss (slow confirm)"
             elif position_type == 'PE':
                 if score >= 10.0:
-                    should_exit = True
-                    reason = "MDS Reversal"
+                    if slow_mom >= 1.0:
+                        should_exit = True
+                        reason = "MDS Reversal (slow confirm)"
                 elif neutral:
-                    should_exit = True
-                    reason = "MDS Neutral"
+                    if abs(slow_mom) <= 1.0:
+                        should_exit = True
+                        reason = "MDS Neutral (slow confirm)"
                 elif slope >= 2.0 and score > -12.0:
-                    should_exit = True
-                    reason = "MDS Momentum Loss"
+                    if slow_mom >= 0.0:
+                        should_exit = True
+                        reason = "MDS Momentum Loss (slow confirm)"
 
             if should_exit:
                 exit_price = bot_state['current_option_ltp']
                 pnl = (exit_price - self.entry_price) * qty
-                logger.warning(f"[MDS] ✗ EXIT | {position_type} | Score={score:.2f} Slope={slope:.2f} | Reason={reason} | P&L=₹{pnl:.2f}")
+                logger.warning(f"[MDS] ✗ EXIT | {position_type} | Score={score:.2f} Slope={slope:.2f} SlowMom={slow_mom:.1f} | Reason={reason} | P&L=₹{pnl:.2f}")
                 closed = await self.close_position(exit_price, pnl, reason)
                 exited = bool(closed)
                 if closed:
@@ -949,6 +1336,7 @@ class TradingBot:
             return False
 
         if not can_take_new_trade():
+            logger.info("[ENTRY_DECISION] NO | Reason=after_cutoff (MDS)")
             return False
 
         if bot_state['daily_trades'] >= config['max_trades_per_day']:
@@ -960,7 +1348,7 @@ class TradingBot:
         if min_gap > 0 and self.last_trade_time:
             time_since_last = (datetime.now() - self.last_trade_time).total_seconds()
             if time_since_last < min_gap:
-                logger.debug(f"[MDS] Skipping - min trade gap not met ({time_since_last:.1f}s < {min_gap}s)")
+                logger.info(f"[ENTRY_DECISION] NO | Reason=min_trade_gap (MDS) ({time_since_last:.1f}s < {min_gap}s)")
                 return False
 
         # Score-engine gates
@@ -978,7 +1366,20 @@ class TradingBot:
         confidence = float(getattr(mds_snapshot, 'confidence', 0.0) or 0.0)
 
         # Require meaningful score + slope
-        if direction == 'NONE' or abs(score) < 10.0 or abs(slope) < 1.0:
+        if direction == 'NONE':
+            logger.info(f"[ENTRY_DECISION] NO | Reason=neutral_band (MDS) | Score={score:.2f} Slope={slope:.2f}")
+            self._mds_last_direction = direction
+            self._mds_confirm_count = 0
+            return False
+
+        if abs(score) < 10.0:
+            logger.info(f"[ENTRY_DECISION] NO | Reason=score_too_low (MDS) | Score={score:.2f} Slope={slope:.2f} Dir={direction}")
+            self._mds_last_direction = direction
+            self._mds_confirm_count = 0
+            return False
+
+        if abs(slope) < 1.0:
+            logger.info(f"[ENTRY_DECISION] NO | Reason=slope_too_low (MDS) | Score={score:.2f} Slope={slope:.2f} Dir={direction}")
             self._mds_last_direction = direction
             self._mds_confirm_count = 0
             return False
@@ -1023,7 +1424,14 @@ class TradingBot:
             f"Index={index_name} LTP={index_ltp:.2f} ATM={atm_strike}"
         )
 
+        before = bot_state.get('current_position')
         await self.enter_position(option_type, atm_strike, index_ltp, override_lots=int(sizing.final_lots))
+        after = bot_state.get('current_position')
+        if before is None and after is not None:
+            logger.info(f"[ENTRY_DECISION] YES | Confirmed (MDS) | {option_type} {atm_strike}")
+        else:
+            logger.info(f"[ENTRY_DECISION] NO | Entry blocked downstream (MDS) | {option_type} {atm_strike}")
+
         self.last_trade_time = datetime.now()
         self._mds_confirm_count = 0
         return False
@@ -1221,19 +1629,23 @@ class TradingBot:
         
         # Check if new trade allowed
         if self.current_position:
+            logger.info("[ENTRY_DECISION] NO | Reason=position_open")
             return exited
 
         # Enforce order cooldown between any two orders (prevents exit->entry flip too fast)
         if not self._can_place_new_entry_order():
             remaining = self._remaining_entry_cooldown()
             logger.info(f"[ENTRY] ✗ Skipping - Order cooldown active ({remaining:.1f}s remaining)")
+            logger.info("[ENTRY_DECISION] NO | Reason=order_cooldown")
             return exited
         
         if not can_take_new_trade():
+            logger.info("[ENTRY_DECISION] NO | Reason=after_cutoff")
             return exited
         
         if bot_state['daily_trades'] >= config['max_trades_per_day']:
             logger.info(f"[SIGNAL] Max daily trades reached ({config['max_trades_per_day']})")
+            logger.info("[ENTRY_DECISION] NO | Reason=max_daily_trades")
             return exited
         
         # Check min_trade_gap protection (optional)
@@ -1241,23 +1653,25 @@ class TradingBot:
         if min_gap > 0 and self.last_trade_time:
             time_since_last = (datetime.now() - self.last_trade_time).total_seconds()
             if time_since_last < min_gap:
-                logger.debug(f"[SIGNAL] Skipping - min trade gap not met ({time_since_last:.1f}s < {min_gap}s)")
+                logger.info(f"[ENTRY_DECISION] NO | Reason=min_trade_gap ({time_since_last:.1f}s < {min_gap}s)")
                 return exited
         
         # Enter new position
         if not signal:
-            logger.debug("[SIGNAL] No signal generated, skipping entry")
+            logger.info("[ENTRY_DECISION] NO | Reason=no_signal")
             return exited
 
         # Trade only on SuperTrend FLIP (candle-to-candle), not based on previous trade state
         if config.get('trade_only_on_flip', False) and not flipped:
             logger.info(f"[ENTRY] ✗ Skipping - No SuperTrend flip this candle | Signal={signal}")
+            logger.info("[ENTRY_DECISION] NO | Reason=no_flip")
             return exited
 
         # MACD CONFIRMATION: require MACD line to confirm direction at candle close
         if config.get('macd_confirmation_enabled', True):
             if not self.macd or self.macd.last_macd is None or self.macd.last_signal_line is None:
                 logger.info("[ENTRY] ✗ Skipping - MACD not ready yet")
+                logger.info("[ENTRY_DECISION] NO | Reason=macd_not_ready")
                 return exited
 
             eps = 1e-9
@@ -1268,12 +1682,14 @@ class TradingBot:
                     f"[ENTRY] ✗ Skipping - MACD not confirming BUY | "
                     f"MACD={self.macd.last_macd:.4f} SIG={self.macd.last_signal_line:.4f}"
                 )
+                logger.info("[ENTRY_DECISION] NO | Reason=macd_not_confirming_buy")
                 return exited
             if signal == 'RED' and bullish:
                 logger.info(
                     f"[ENTRY] ✗ Skipping - MACD not confirming SELL | "
                     f"MACD={self.macd.last_macd:.4f} SIG={self.macd.last_signal_line:.4f}"
                 )
+                logger.info("[ENTRY_DECISION] NO | Reason=macd_not_confirming_sell")
                 return exited
 
         # MTF FILTER: If trading below 1m, only take entries aligned with 1m SuperTrend direction
@@ -1283,11 +1699,13 @@ class TradingBot:
             required = 1 if signal == 'GREEN' else -1
             if htf_direction == 0:
                 logger.info("[ENTRY] ✗ Skipping - HTF SuperTrend not ready yet (need 1m candles)")
+                logger.info("[ENTRY_DECISION] NO | Reason=htf_not_ready")
                 return exited
 
             if htf_direction != required:
                 htf_side = 'GREEN' if htf_direction == 1 else 'RED'
                 logger.info(f"[ENTRY] ✗ Skipping - HTF filter mismatch | LTF={signal}, HTF={htf_side}")
+                logger.info("[ENTRY_DECISION] NO | Reason=htf_mismatch")
                 return exited
         
         # NOTE: Previously we compared against last trade signal (self.last_signal).
@@ -1304,8 +1722,14 @@ class TradingBot:
             f"ATM Strike: {atm_strike} | "
             f"SuperTrend: {bot_state['supertrend_value']:.2f}"
         )
-        
+
+        before = bot_state.get('current_position')
         await self.enter_position(option_type, atm_strike, index_ltp)
+        after = bot_state.get('current_position')
+        if before is None and after is not None:
+            logger.info(f"[ENTRY_DECISION] YES | Confirmed | {option_type} {atm_strike}")
+        else:
+            logger.info(f"[ENTRY_DECISION] NO | Entry blocked downstream | {option_type} {atm_strike}")
         self.last_trade_time = datetime.now()
         
         return exited

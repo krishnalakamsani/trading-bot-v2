@@ -20,6 +20,7 @@ from models import ConfigUpdate, StrategyCreate, StrategyRename, StrategyDuplica
 from database import (
     init_db,
     load_config,
+    prune_backend_market_data,
     get_trades,
     get_trade_analytics,
     upsert_strategy,
@@ -44,6 +45,10 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Reduce noisy per-request logs from http clients (used for MDS polling).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # Ensure directories exist
 (ROOT_DIR / 'logs').mkdir(exist_ok=True)
@@ -83,18 +88,106 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 _market_data_service = None
+_mds_consumer_task: asyncio.Task | None = None
+
+
+async def _mds_consumer_loop():
+    """Continuously consume latest candle close from market-data-service.
+
+    This keeps the UI market feed live even when the trading bot is stopped.
+    It does not persist anything to backend SQLite.
+    """
+    try:
+        from mds_client import fetch_latest_close
+    except Exception as e:
+        logger.warning(f"[MDS] Consumer disabled (import error): {e}")
+        return
+
+    dhan_fallback = None
+
+    while True:
+        try:
+            if str(config.get('market_data_provider', '')).strip().lower() != 'mds':
+                await asyncio.sleep(2)
+                continue
+
+            if not bool(config.get('enable_mds_consumer', True)):
+                await asyncio.sleep(2)
+                continue
+
+            base_url = str(config.get('mds_base_url', '') or '').strip()
+            if not base_url:
+                await asyncio.sleep(2)
+                continue
+
+            index_name = config.get('selected_index', 'NIFTY')
+            tf = int(config.get('candle_interval', 5) or 5)
+            poll_s = float(config.get('mds_poll_seconds', 1.0) or 1.0)
+
+            close_price, _ts = await fetch_latest_close(
+                base_url=base_url,
+                symbol=index_name,
+                timeframe_seconds=tf,
+                min_poll_seconds=poll_s,
+            )
+
+            if close_price is not None and close_price > 0:
+                bot_state['index_ltp'] = float(close_price)
+            else:
+                # Fallback: if MDS has no candles (e.g., not yet backfilled/streaming),
+                # keep the UI feed live via Dhan quotes (no persistence).
+                if config.get('dhan_access_token') and config.get('dhan_client_id'):
+                    try:
+                        if dhan_fallback is None:
+                            from dhan_api import DhanAPI
+
+                            dhan_fallback = DhanAPI(config.get('dhan_access_token'), config.get('dhan_client_id'))
+                        ltp = await asyncio.to_thread(dhan_fallback.get_index_ltp, index_name)
+                        if ltp and float(ltp) > 0:
+                            bot_state['index_ltp'] = float(ltp)
+                    except Exception:
+                        pass
+
+            await asyncio.sleep(max(0.5, poll_s))
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"[MDS] Consumer error: {e}")
+            await asyncio.sleep(2)
 
 
 # Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _market_data_service, _mds_consumer_task
+
     await init_db()
     await load_config()
     logger.info(f"[STARTUP] Database initialized, config loaded. Index={config.get('selected_index', 'NIFTY')}, Indicator=SuperTrend")
 
-    # Start independent market-data capture (runs even if bot is stopped)
-    global _market_data_service
-    if config.get("dhan_access_token") and config.get("dhan_client_id"):
+    # Keep backend SQLite minimal (prune tick/candle tables unless explicitly enabled).
+    if bool(config.get('prune_db_on_startup', True)):
+        try:
+            result = await prune_backend_market_data()
+            logger.info(f"[STARTUP] DB prune: {result}")
+        except Exception as e:
+            logger.warning(f"[STARTUP] DB prune skipped: {e}")
+
+    # Start MDS consumer (consume-only, no backend DB writes) for UI market feed.
+    try:
+        if (
+            str(config.get('market_data_provider', '')).strip().lower() == 'mds'
+            and bool(config.get('enable_mds_consumer', True))
+        ):
+            _mds_consumer_task = asyncio.create_task(_mds_consumer_loop())
+            logger.info('[MDS] Consumer started')
+    except Exception as e:
+        logger.warning(f"[MDS] Consumer not started: {e}")
+
+    # Optional legacy: Start independent market-data capture (runs even if bot is stopped).
+    # Default OFF when using the separate market-data-service container.
+    if bool(config.get('enable_internal_market_data_service', False)) and config.get("dhan_access_token") and config.get("dhan_client_id"):
         try:
             from dhan_api import DhanAPI
             from market_data_service import MarketDataService
@@ -106,15 +199,24 @@ async def lifespan(app: FastAPI):
             _market_data_service = None
             logger.warning(f"[STARTUP] MarketDataService not started: {e}")
 
-    yield
+    try:
+        yield
+    finally:
+        if _market_data_service is not None:
+            try:
+                await _market_data_service.stop()
+            except Exception:
+                pass
+            _market_data_service = None
 
-    if _market_data_service is not None:
-        try:
-            await _market_data_service.stop()
-        except Exception:
-            pass
-        _market_data_service = None
-    logger.info("[SHUTDOWN] Server shutting down")
+        if _mds_consumer_task is not None:
+            try:
+                _mds_consumer_task.cancel()
+            except Exception:
+                pass
+            _mds_consumer_task = None
+
+        logger.info("[SHUTDOWN] Server shutting down")
 
 
 app = FastAPI(lifespan=lifespan)

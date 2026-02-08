@@ -21,6 +21,9 @@ const Settings = () => {
   const navigate = useNavigate();
   const { config, updateConfig, botStatus, position } = useContext(AppContext);
 
+  const canChangeRunContext = !botStatus?.is_running && !position?.has_position;
+  const [bypassMarketHoursUpdating, setBypassMarketHoursUpdating] = useState(false);
+
   // API Credentials
   const [accessToken, setAccessToken] = useState("");
   const [clientId, setClientId] = useState("");
@@ -58,6 +61,10 @@ const Settings = () => {
   const [minOrderCooldownSeconds, setMinOrderCooldownSeconds] = useState(
     config.min_order_cooldown_seconds || 15
   );
+
+  // Paper replay (testing)
+  const [paperReplayEnabled, setPaperReplayEnabled] = useState(!!config.paper_replay_enabled);
+  const [paperReplayDateIst, setPaperReplayDateIst] = useState(config.paper_replay_date_ist || "");
 
   // Saved strategies
   const [strategies, setStrategies] = useState([]);
@@ -103,6 +110,9 @@ const Settings = () => {
       setHtfFilterTimeframe(config?.htf_filter_timeframe || 60);
       setMinHoldSeconds(config?.min_hold_seconds || 15);
       setMinOrderCooldownSeconds(config?.min_order_cooldown_seconds || 15);
+
+      setPaperReplayEnabled(!!config?.paper_replay_enabled);
+      setPaperReplayDateIst(String(config?.paper_replay_date_ist || ""));
 
       isFirstRender.current = false;
     }
@@ -159,6 +169,26 @@ const Settings = () => {
       min_order_cooldown_seconds: minOrderCooldownSeconds,
     });
     setSaving(false);
+  };
+
+  const handleSaveReplayParams = async () => {
+    if (paperReplayEnabled && !String(paperReplayDateIst || "").trim()) {
+      toast.error("Select a replay date");
+      return;
+    }
+    setSaving(true);
+    await updateConfig({
+      paper_replay_enabled: !!paperReplayEnabled,
+      paper_replay_date_ist: String(paperReplayDateIst || ""),
+    });
+    setSaving(false);
+  };
+
+  const handleBypassMarketHoursChange = async (checked) => {
+    if (!canChangeRunContext) return;
+    setBypassMarketHoursUpdating(true);
+    await updateConfig({ bypass_market_hours: !!checked });
+    setBypassMarketHoursUpdating(false);
   };
 
   const buildStrategyConfig = () => {
@@ -991,6 +1021,86 @@ const Settings = () => {
                   data-testid="min-order-cooldown-input"
                 />
                 <p className="text-xs text-gray-500 mt-1">0 = disabled</p>
+              </div>
+            </div>
+
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Bypass Market Hours</div>
+
+              <div className="flex items-center justify-between p-3 bg-white rounded-sm border border-gray-200">
+                <div>
+                  <Label htmlFor="bypass-market-hours-toggle" className="text-sm font-medium">
+                    Run Outside Market Hours
+                  </Label>
+                  <p className="text-xs text-gray-500">Use with caution (paper testing)</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-gray-500">Off</span>
+                  <Switch
+                    id="bypass-market-hours-toggle"
+                    checked={!!config?.bypass_market_hours}
+                    onCheckedChange={handleBypassMarketHoursChange}
+                    disabled={!canChangeRunContext || bypassMarketHoursUpdating}
+                    data-testid="bypass-market-hours-toggle"
+                  />
+                  <span className="text-xs font-medium text-emerald-700">On</span>
+                </div>
+              </div>
+
+              {!canChangeRunContext && (
+                <p className="text-xs text-amber-600">Stop bot and close position to change</p>
+              )}
+            </div>
+
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Paper Replay</div>
+
+              <div className="flex items-center justify-between p-3 bg-white rounded-sm border border-gray-200">
+                <div>
+                  <Label htmlFor="paper-replay-enabled" className="text-sm font-medium">
+                    Enable Replay (Paper Mode)
+                  </Label>
+                  <p className="text-xs text-gray-500">Replays historical MDS candles for a selected IST date</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-gray-500">Off</span>
+                  <Switch
+                    id="paper-replay-enabled"
+                    checked={!!paperReplayEnabled}
+                    onCheckedChange={setPaperReplayEnabled}
+                    data-testid="paper-replay-enabled-toggle"
+                  />
+                  <span className="text-xs font-medium text-emerald-700">On</span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="paper-replay-date">Replay Date (IST)</Label>
+                  <Input
+                    id="paper-replay-date"
+                    type="date"
+                    value={paperReplayDateIst}
+                    onChange={(e) => setPaperReplayDateIst(e.target.value)}
+                    disabled={!paperReplayEnabled}
+                    className="mt-1 rounded-sm"
+                    data-testid="paper-replay-date-input"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Used with bypass market hours</p>
+                </div>
+              </div>
+
+              <div className="flex justify-end">
+                <Button
+                  onClick={handleSaveReplayParams}
+                  disabled={saving}
+                  size="sm"
+                  className="rounded-sm btn-active"
+                  data-testid="save-replay-params-btn"
+                >
+                  <Save className="w-3 h-3 mr-1" />
+                  {saving ? "Saving..." : "Save Replay Settings"}
+                </Button>
               </div>
             </div>
 

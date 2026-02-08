@@ -40,6 +40,7 @@ class TFScore:
     macd_score: float
     hist_score: float
     st_score: float
+    bonus_score: float
     raw_score: float
     weighted_score: float
     st_direction: int  # 1 bullish, -1 bearish, 0 unknown
@@ -89,6 +90,9 @@ class ScoreEngine:
         macd_slow: int,
         macd_signal: int,
         base_timeframe_seconds: int = 5,
+        bonus_macd_triple: float = 1.0,
+        bonus_macd_momentum: float = 0.5,
+        bonus_macd_cross: float = 0.5,
     ):
         self.base_tf = int(base_timeframe_seconds)
         if self.base_tf not in self._TF_CHAIN:
@@ -102,8 +106,18 @@ class ScoreEngine:
             self.timeframes[1]: 2.0,
         }
 
+        # Bonus score knobs (added on top of the base MACD/HIST/ST scoring).
+        # These are symmetric (+ for bullish alignment, - for bearish alignment).
+        self.bonus_macd_triple = float(bonus_macd_triple or 0.0)
+        self.bonus_macd_momentum = float(bonus_macd_momentum or 0.0)
+        self.bonus_macd_cross = float(bonus_macd_cross or 0.0)
+
+        # Base per-timeframe raw max is 6.0 (= 2 MACD + 2 HIST + 2 ST).
+        # Add bonus headroom so neutral-band / chop scaling stays consistent.
+        self._max_tf_raw = 6.0 + max(0.0, self.bonus_macd_triple) + max(0.0, self.bonus_macd_momentum) + max(0.0, self.bonus_macd_cross)
+
         # Direction band scales with the maximum possible score.
-        max_possible = 6.0 * sum(self.tf_weights.values())
+        max_possible = self._max_tf_raw * sum(self.tf_weights.values())
         self.neutral_band = max(4.0, round(0.30 * max_possible, 2))
 
         # Chop window: target ~2 minutes worth of base candles (min 8)
@@ -120,6 +134,16 @@ class ScoreEngine:
         self._agg_partial: Dict[int, dict] = {self.timeframes[1]: {}}
         self._score_history: Deque[float] = deque(maxlen=max(60, self.chop_window * 5))
         self._slope_history: Deque[float] = deque(maxlen=max(60, self.chop_window * 5))
+
+        # Persist last computed TFScore per timeframe so higher-TF contribution remains
+        # stable between its candle completions.
+        self._last_scores: Dict[int, TFScore] = {}
+        for tf in self.timeframes:
+            self._last_scores[tf] = self._neutral_tf_score(tf)
+
+    def _neutral_tf_score(self, tf: int) -> TFScore:
+        w = self.tf_weights.get(tf, 1.0)
+        return TFScore(tf, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 * w, 0)
 
     def _next_tf(self, tf: int) -> int:
         chain = list(self._TF_CHAIN)
@@ -142,6 +166,8 @@ class ScoreEngine:
         self._agg_partial = {self.timeframes[1]: {}}
         self._score_history.clear()
         self._slope_history.clear()
+        for tf in self.timeframes:
+            self._last_scores[tf] = self._neutral_tf_score(tf)
 
     def on_base_candle(self, candle: Candle) -> MDSnapshot:
         """Consume a base candle (selected timeframe); returns latest snapshot."""
@@ -156,10 +182,10 @@ class ScoreEngine:
         if completed is not None:
             tf_scores[next_tf] = self._update_tf(next_tf, completed)
 
-        # Compute total score using latest available TF scores (missing TFs contribute 0)
+        # Compute total score using last-known TF scores (slow TF persists between updates)
         total_score = 0.0
         for tf in self.timeframes:
-            total_score += tf_scores.get(tf, self._last_tf_score(tf)).weighted_score
+            total_score += self._last_tf_score(tf).weighted_score
 
         prev_score = self._score_history[-1] if self._score_history else None
         slope = 0.0 if prev_score is None else (total_score - prev_score)
@@ -178,6 +204,9 @@ class ScoreEngine:
         ready_tfs = tuple(sorted(self._ready_timeframes()))
         ready = all(tf in ready_tfs for tf in self.timeframes)
 
+        # Always expose latest known TF scores for both timeframes
+        snapshot_tf_scores = {tf: self._last_tf_score(tf) for tf in self.timeframes}
+
         return MDSnapshot(
             score=round(total_score, 3),
             slope=round(slope, 3),
@@ -186,7 +215,7 @@ class ScoreEngine:
             confidence=round(confidence, 3),
             is_choppy=bool(is_choppy),
             direction=direction,
-            tf_scores={k: v for k, v in sorted(tf_scores.items())},
+            tf_scores={k: v for k, v in sorted(snapshot_tf_scores.items())},
             ready=bool(ready),
             ready_timeframes=ready_tfs,
         )
@@ -219,9 +248,7 @@ class ScoreEngine:
         return None
 
     def _last_tf_score(self, tf: int) -> TFScore:
-        # If TF hasn't updated yet, treat as neutral.
-        w = self.tf_weights.get(tf, 1.0)
-        return TFScore(tf, 0.0, 0.0, 0.0, 0.0, 0.0 * w, 0)
+        return self._last_scores.get(tf) or self._neutral_tf_score(tf)
 
     def _update_tf(self, tf: int, candle: Candle) -> TFScore:
         state = self._tfs[tf]
@@ -309,19 +336,59 @@ class ScoreEngine:
 
             state.prev_hist = hist
 
-        raw = macd_score + hist_score + st_score
+        # Bonus scoring
+        bonus = 0.0
+
+        # 1) "All 3 MACD values" alignment bonus: MACD line, signal line, histogram
+        #    - all > 0 => bullish bonus
+        #    - all < 0 => bearish bonus
+        # Use small normalized thresholds to avoid awarding bonus near zero.
+        signal_line = state.macd.last_signal_line
+        if macd is not None and signal_line is not None and hist is not None:
+            macd_norm = macd / max(abs(close), self._NORM_EPS)
+            sig_norm = signal_line / max(abs(close), self._NORM_EPS)
+            hist_norm = hist / max(abs(close), self._NORM_EPS)
+
+            macd_ok = abs(macd_norm) > self._MACD_FLAT_DIFF_NORM
+            sig_ok = abs(sig_norm) > self._MACD_FLAT_DIFF_NORM
+            hist_ok = abs(hist_norm) > self._HIST_NEAR_ZERO_NORM
+
+            if macd_ok and sig_ok and hist_ok:
+                if macd > 0 and signal_line > 0 and hist > 0:
+                    bonus += self.bonus_macd_triple
+                elif macd < 0 and signal_line < 0 and hist < 0:
+                    bonus -= self.bonus_macd_triple
+
+        # 2) Strong momentum bonus: when MACD + HIST both strongly agree (already scored),
+        # add a small kicker to improve conviction during clean trends.
+        if macd_score >= 2.0 and hist_score >= 2.0:
+            bonus += self.bonus_macd_momentum
+        elif macd_score <= -2.0 and hist_score <= -2.0:
+            bonus -= self.bonus_macd_momentum
+
+        # 3) Cross bonus: MACD crossing signal line often marks a regime shift.
+        cross = state.macd.last_cross
+        if cross == "GREEN":
+            bonus += self.bonus_macd_cross
+        elif cross == "RED":
+            bonus -= self.bonus_macd_cross
+
+        raw = macd_score + hist_score + st_score + bonus
         weight = self.tf_weights.get(tf, 1.0)
         weighted = raw * weight
 
-        return TFScore(
+        out = TFScore(
             timeframe_seconds=tf,
             macd_score=macd_score,
             hist_score=hist_score,
             st_score=st_score,
+            bonus_score=bonus,
             raw_score=raw,
             weighted_score=weighted,
             st_direction=st_dir,
         )
+        self._last_scores[tf] = out
+        return out
 
     def _ready_timeframes(self) -> set[int]:
         ready = set()
@@ -352,7 +419,7 @@ class ScoreEngine:
         mean_abs = sum(abs(s) for s in window) / max(1, len(window))
 
         # Scale thresholds with score range (older engine assumed ~45 max score)
-        max_possible = 6.0 * sum(self.tf_weights.values())
+        max_possible = self._max_tf_raw * sum(self.tf_weights.values())
         scale = max(0.35, min(1.0, max_possible / 45.0))
         stab_hi = 7.5 * scale
         mean_abs_mid = 12.0 * scale

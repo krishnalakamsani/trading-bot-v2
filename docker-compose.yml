@@ -40,6 +40,10 @@ services:
       - DHAN_EPOCH_IS_IST=true
       - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
       - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+      - FETCH_CREDS_FROM_BACKEND=true
+      - BACKEND_SQLITE_PATH=/shared/backend_data/trading.db
+    volumes:
+      - ./backend/data:/shared/backend_data:ro
     depends_on:
       timescaledb:
         condition: service_healthy
@@ -90,6 +94,14 @@ services:
       - ./backend/logs:/app/logs
     environment:
       - CORS_ORIGINS=*
+      - MARKET_DATA_PROVIDER=mds
+      - MDS_BASE_URL=http://market-data-service:8002/v1
+      - ENABLE_INTERNAL_MARKET_DATA_SERVICE=false
+      - STORE_TICK_DATA=false
+      - STORE_CANDLE_DATA=false
+      - PRUNE_DB_ON_STARTUP=true
+      - MAX_TICK_ROWS=0
+      - MAX_CANDLE_ROWS=0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/api/status"]
       interval: 30s

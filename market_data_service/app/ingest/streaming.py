@@ -8,6 +8,7 @@ from ..settings import settings
 from ..db import get_pool, upsert_candles_bulk
 from .dhan_client import CandleRow
 from .dhan_client import DhanClient
+from .creds_sync import creds_refresh_loop, refresh_dhan_credentials_from_backend
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ class StreamingSupervisor:
         self._running = False
         self._task: asyncio.Task | None = None
         self._dhan = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
+        self._cred_key: tuple[str, str] = (str(settings.dhan_client_id), str(settings.dhan_access_token))
+        self._creds_stop = asyncio.Event()
+        self._creds_task: asyncio.Task | None = None
 
         self._cur = {}  # (symbol) -> candle builder state
 
@@ -39,6 +43,8 @@ class StreamingSupervisor:
         if self._running:
             return
         self._running = True
+        self._creds_stop.clear()
+        self._creds_task = asyncio.create_task(creds_refresh_loop(self._creds_stop))
         self._task = asyncio.create_task(self._loop())
 
     async def stop(self):
@@ -46,6 +52,11 @@ class StreamingSupervisor:
         if self._task:
             self._task.cancel()
             self._task = None
+
+        if self._creds_task:
+            self._creds_stop.set()
+            self._creds_task.cancel()
+            self._creds_task = None
 
     async def _upsert_candle(self, symbol: str, timeframe_seconds: int, ts: datetime, o: float, h: float, l: float, c: float):
         await upsert_candles_bulk(
@@ -60,22 +71,33 @@ class StreamingSupervisor:
         base_tf = int(settings.candle_base_seconds)
         poll = float(settings.poll_seconds)
 
-        # If Dhan is not wired yet, keep the service healthy but idle.
-        if not self._dhan.ready():
-            logger.warning("[STREAM] Dhan credentials/SDK not ready; streaming idle")
+        # Attempt a first refresh (in case env creds are not set but backend has them)
+        try:
+            await refresh_dhan_credentials_from_backend()
+        except Exception:
+            pass
 
         while self._running:
             try:
+                # Rebuild Dhan client if credentials changed
+                new_key = (str(settings.dhan_client_id), str(settings.dhan_access_token))
+                if new_key != self._cred_key:
+                    self._dhan = DhanClient(settings.dhan_client_id, settings.dhan_access_token)
+                    self._cred_key = new_key
+
+                if not self._dhan.ready():
+                    await asyncio.sleep(max(1.0, poll))
+                    continue
+
                 now = datetime.now(timezone.utc)
                 bucket = _floor_ts(now, base_tf)
 
                 for symbol in settings.symbols:
                     ltp = None
-                    if self._dhan.ready():
-                        try:
-                            ltp = self._dhan.get_index_ltp(symbol)
-                        except NotImplementedError:
-                            ltp = None
+                    try:
+                        ltp = await asyncio.to_thread(self._dhan.get_index_ltp, symbol)
+                    except Exception:
+                        ltp = None
 
                     if ltp is None or ltp <= 0:
                         continue

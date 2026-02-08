@@ -20,6 +20,17 @@ class Settings(BaseModel):
     dhan_client_id: str = os.getenv("DHAN_CLIENT_ID", "")
     dhan_access_token: str = os.getenv("DHAN_ACCESS_TOKEN", "")
 
+    # Optional: pull credentials from backend (frontend updates backend daily)
+    fetch_creds_from_backend: bool = os.getenv("FETCH_CREDS_FROM_BACKEND", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    backend_base_url: str = os.getenv("BACKEND_BASE_URL", "")  # e.g. http://backend:8001/api
+    internal_api_secret: str = os.getenv("INTERNAL_API_SECRET", "")
+    creds_refresh_seconds: float = float(os.getenv("CREDS_REFRESH_SECONDS", "30"))
+    backend_sqlite_path: str = os.getenv("BACKEND_SQLITE_PATH", "")  # e.g. /shared/backend_data/trading.db
+
     # Dhan historical bulk candles endpoint (1-minute only)
     dhan_base_url: str = os.getenv("DHAN_BASE_URL", "")
     dhan_historical_url: str = os.getenv("DHAN_HISTORICAL_URL", "")

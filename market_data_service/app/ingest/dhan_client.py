@@ -222,14 +222,72 @@ class DhanClient:
     def get_index_ltp(self, symbol: str) -> float | None:
         """Return current index LTP.
 
-        Wire this to your existing backend Dhan wrapper logic if desired.
+        Uses dhanhq SDK quote_data.
         """
         if not self.ready():
             return None
 
-        # TODO: implement with your Dhan wrapper / SDK calls.
-        # Keep this adapter minimal and testable.
-        raise NotImplementedError("Implement index quote fetch via Dhan")
+        if self._sdk is None:
+            return None
+
+        inst = get_dhan_instrument(symbol)
+        security_id = str(inst.security_id or "").strip()
+        if not security_id or security_id == "0":
+            return None
+
+        # Some symbols (e.g. SENSEX) can be exposed under different segments.
+        segments_to_try = [str(inst.exchange_segment or "IDX_I")]
+        if str(symbol or "").strip().upper() == "SENSEX":
+            for seg in ("IDX_I", "BSE_INDEX", "BSE"):
+                if seg not in segments_to_try:
+                    segments_to_try.append(seg)
+
+        try:
+            sid_int = int(float(security_id))
+        except Exception:
+            return None
+
+        for seg in segments_to_try:
+            try:
+                resp = self._sdk.quote_data({seg: [sid_int]})
+            except Exception:
+                continue
+
+            if not resp or resp.get("status") != "success":
+                continue
+
+            data = resp.get("data", {})
+            if isinstance(data, dict) and "data" in data and isinstance(data.get("data"), dict):
+                data = data.get("data", {})
+
+            if not isinstance(data, dict):
+                continue
+
+            seg_data = data.get(seg, {})
+            if not isinstance(seg_data, dict):
+                continue
+
+            row = seg_data.get(str(sid_int), {})
+            if not isinstance(row, dict) or not row:
+                continue
+
+            ltp = row.get("last_price")
+            try:
+                if ltp is not None and float(ltp) > 0:
+                    return float(ltp)
+            except Exception:
+                pass
+
+            ohlc = row.get("ohlc", {})
+            if isinstance(ohlc, dict):
+                close = ohlc.get("close")
+                try:
+                    if close is not None and float(close) > 0:
+                        return float(close)
+                except Exception:
+                    pass
+
+        return None
 
     def get_historical_candles(
         self,
