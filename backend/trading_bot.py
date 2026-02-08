@@ -11,6 +11,8 @@ from config import bot_state, config, DB_PATH
 from indices import get_index_config, round_to_strike
 from utils import get_ist_time, is_market_open, can_take_new_trade, should_force_squareoff, format_timeframe
 from indicators import SuperTrend, MACD
+from score_engine import ScoreEngine, Candle
+from position_sizing import PositionSizingAgent
 from dhan_api import DhanAPI
 from database import save_trade, update_trade_exit
 
@@ -31,12 +33,18 @@ class TradingBot:
         self.indicator = None  # Will hold selected indicator
         self.htf_indicator = None  # Higher-timeframe SuperTrend (e.g., 1m filter)
         self.macd = None  # LTF MACD for confirmation
+        self.score_engine = None  # Multi-timeframe score engine (optional)
+        self._mds_last_direction = None
+        self._mds_confirm_count = 0
         self.last_exit_candle_time = None
         self.last_trade_time = None  # For min_trade_gap protection
         self.last_signal = None  # For trade_only_on_flip protection
         self._last_entries_paused_log_time = None
         self.entry_time_utc = None  # datetime for min-hold exit protection
         self.last_order_time_utc = None  # datetime for order cooldown (entry/exit pacing)
+        self._paper_replay_candles = []
+        self._paper_replay_pos = 0
+        self._paper_replay_htf_elapsed = 0
         self._initialize_indicator()
 
     def _can_place_new_entry_order(self) -> bool:
@@ -63,11 +71,41 @@ class TradingBot:
     def initialize_dhan(self):
         """Initialize Dhan API connection"""
         if config['dhan_access_token'] and config['dhan_client_id']:
-            self.dhan = DhanAPI(config['dhan_access_token'], config['dhan_client_id'])
-            logger.info("[MARKET] Dhan API initialized")
-            return True
+            try:
+                self.dhan = DhanAPI(config['dhan_access_token'], config['dhan_client_id'])
+                logger.info("[MARKET] Dhan API initialized")
+                return True
+            except Exception as e:
+                self.dhan = None
+                logger.warning(f"[ERROR] Dhan API init failed: {e}")
+                return False
         logger.warning("[ERROR] Dhan API credentials not configured")
         return False
+
+    async def _init_paper_replay(self) -> None:
+        """Load candle data from DB for after-hours paper replay."""
+        try:
+            from database import get_candle_data_for_replay
+
+            index_name = config.get('selected_index', 'NIFTY')
+            interval = int(config.get('candle_interval', 5) or 5)
+            date_ist = str(config.get('paper_replay_date_ist', '') or '').strip() or None
+
+            candles = await get_candle_data_for_replay(
+                index_name=index_name,
+                interval_seconds=interval,
+                date_ist=date_ist,
+                limit=20000,
+            )
+            self._paper_replay_candles = candles or []
+            self._paper_replay_pos = 0
+            self._paper_replay_htf_elapsed = 0
+            logger.info(f"[REPLAY] Loaded {len(self._paper_replay_candles)} candles | Index={index_name} Interval={interval}s DateIST={date_ist or 'latest'}")
+        except Exception as e:
+            self._paper_replay_candles = []
+            self._paper_replay_pos = 0
+            self._paper_replay_htf_elapsed = 0
+            logger.error(f"[REPLAY] Failed to load candles: {e}")
     
     def _initialize_indicator(self):
         """Initialize indicators (SuperTrend + optional MACD confirmation)"""
@@ -87,6 +125,15 @@ class TradingBot:
                 slow=int(config.get('macd_slow', 26)),
                 signal=int(config.get('macd_signal', 9)),
             )
+
+            self.score_engine = ScoreEngine(
+                st_period=int(config.get('supertrend_period', 7)),
+                st_multiplier=float(config.get('supertrend_multiplier', 4)),
+                macd_fast=int(config.get('macd_fast', 12)),
+                macd_slow=int(config.get('macd_slow', 26)),
+                macd_signal=int(config.get('macd_signal', 9)),
+                base_timeframe_seconds=int(config.get('candle_interval', 5) or 5),
+            )
             logger.info(f"[SIGNAL] SuperTrend initialized")
         except Exception as e:
             logger.error(f"[ERROR] Failed to initialize indicator: {e}")
@@ -94,6 +141,7 @@ class TradingBot:
             self.indicator = SuperTrend(period=7, multiplier=4)
             self.htf_indicator = SuperTrend(period=7, multiplier=4)
             self.macd = MACD(fast=12, slow=26, signal=9)
+            self.score_engine = ScoreEngine(st_period=7, st_multiplier=4, macd_fast=12, macd_slow=26, macd_signal=9, base_timeframe_seconds=int(config.get('candle_interval', 5) or 5))
             logger.info(f"[SIGNAL] SuperTrend (fallback) initialized")
     
     def reset_indicator(self):
@@ -104,7 +152,25 @@ class TradingBot:
             self.htf_indicator.reset()
         if self.macd:
             self.macd.reset()
-            logger.info(f"[SIGNAL] Indicator reset: {config.get('indicator_type', 'supertrend')}")
+        if self.score_engine:
+            self.score_engine.reset()
+        else:
+            # If score_engine wasn't initialized for some reason, try to initialize now.
+            try:
+                self.score_engine = ScoreEngine(
+                    st_period=int(config.get('supertrend_period', 7)),
+                    st_multiplier=float(config.get('supertrend_multiplier', 4)),
+                    macd_fast=int(config.get('macd_fast', 12)),
+                    macd_slow=int(config.get('macd_slow', 26)),
+                    macd_signal=int(config.get('macd_signal', 9)),
+                    base_timeframe_seconds=int(config.get('candle_interval', 5) or 5),
+                )
+            except Exception:
+                self.score_engine = None
+
+        self._mds_last_direction = None
+        self._mds_confirm_count = 0
+        logger.info(f"[SIGNAL] Indicator reset: {config.get('indicator_type', 'supertrend')}")
     
     def is_within_trading_hours(self) -> bool:
         """Check if current time allows new entries
@@ -112,7 +178,9 @@ class TradingBot:
         Returns:
             bool: True if within allowed trading hours, False otherwise
         """
-        if config.get('bypass_market_hours', False):
+        if config.get('bypass_market_hours', False) or (
+            bot_state.get('mode') == 'paper' and config.get('paper_replay_enabled', False)
+        ):
             return True
 
         ist = get_ist_time()
@@ -139,8 +207,16 @@ class TradingBot:
         if self.running:
             return {"status": "error", "message": "Bot already running"}
         
-        if not self.initialize_dhan():
-            return {"status": "error", "message": "Dhan API credentials not configured"}
+        # Only require Dhan in live mode. Paper mode can run without broker SDK.
+        if bot_state.get('mode') != 'paper':
+            if not self.initialize_dhan():
+                return {"status": "error", "message": "Dhan API not available (credentials/SDK)"}
+
+        # Prepare replay candles for after-hours paper simulation
+        if bot_state.get('mode') == 'paper' and config.get('paper_replay_enabled', False):
+            await self._init_paper_replay()
+            if not self._paper_replay_candles:
+                return {"status": "error", "message": "Paper replay enabled but no candles found in DB"}
         
         self.running = True
         bot_state['is_running'] = True
@@ -333,6 +409,10 @@ class TradingBot:
             try:
                 index_name = config['selected_index']
                 candle_interval = config['candle_interval']
+
+                replay_enabled = (
+                    bot_state.get('mode') == 'paper' and bool(config.get('paper_replay_enabled', False))
+                )
                 
                 # Check daily reset (9:15 AM IST)
                 ist = get_ist_time()
@@ -349,13 +429,13 @@ class TradingBot:
                     self.reset_indicator()
                     logger.info("[BOT] Daily reset at 9:15 AM")
                 
-                # Force square-off at 3:25 PM
-                if should_force_squareoff() and self.current_position:
+                # Force square-off at 3:25 PM (skip during paper replay)
+                if (not replay_enabled) and should_force_squareoff() and self.current_position:
                     logger.info("[EXIT] Auto squareoff at 3:25 PM")
                     await self.squareoff()
-                
-                # Check if trading is allowed
-                if not is_market_open():
+
+                # Check if trading is allowed (skip during paper replay)
+                if (not replay_enabled) and (not is_market_open()):
                     await asyncio.sleep(5)
                     continue
                 
@@ -363,8 +443,146 @@ class TradingBot:
                     await asyncio.sleep(5)
                     continue
                 
-                # Fetch market data
-                if self.dhan:
+                # Paper replay: drive candles from DB (after-hours simulation)
+                if replay_enabled:
+                    if self._paper_replay_pos >= len(self._paper_replay_candles):
+                        logger.info("[REPLAY] Completed candle replay")
+                        self.running = False
+                        bot_state['is_running'] = False
+                        break
+
+                    row = self._paper_replay_candles[self._paper_replay_pos]
+                    self._paper_replay_pos += 1
+
+                    try:
+                        high = float(row.get('high') or 0.0)
+                        low = float(row.get('low') or float('inf'))
+                        close = float(row.get('close') or 0.0)
+                    except Exception:
+                        high, low, close = 0.0, float('inf'), 0.0
+
+                    # Treat candle close price as current LTP
+                    if close > 0:
+                        bot_state['index_ltp'] = close
+
+                    # Update HTF (replay-time based, not wall-clock)
+                    if config.get('htf_filter_enabled', True) and int(candle_interval) < 60 and close > 0:
+                        if close > htf_high:
+                            htf_high = close
+                        if close < htf_low:
+                            htf_low = close
+                        htf_close = close
+
+                        htf_seconds = int(config.get('htf_filter_timeframe', 60) or 60)
+                        if htf_seconds != 60:
+                            htf_seconds = 60
+
+                        self._paper_replay_htf_elapsed += int(candle_interval)
+                        if self._paper_replay_htf_elapsed >= htf_seconds:
+                            htf_candle_number += 1
+                            if htf_high > 0 and htf_low < float('inf'):
+                                htf_value, htf_signal = self.htf_indicator.add_candle(htf_high, htf_low, htf_close)
+                                if htf_value:
+                                    bot_state['htf_supertrend_value'] = htf_value if isinstance(htf_value, (int, float)) else str(htf_value)
+                                    if htf_signal == "GREEN":
+                                        bot_state['htf_signal_status'] = "buy"
+                                    elif htf_signal == "RED":
+                                        bot_state['htf_signal_status'] = "sell"
+                                    else:
+                                        bot_state['htf_signal_status'] = "waiting"
+                                    if htf_signal:
+                                        bot_state['htf_supertrend_signal'] = htf_signal
+
+                            htf_high, htf_low, htf_close = 0, float('inf'), 0
+                            self._paper_replay_htf_elapsed = 0
+
+                    # Score/indicator update on every replay candle
+                    candle_number += 1
+                    if high > 0 and low < float('inf'):
+                        indicator_value, signal = self.indicator.add_candle(high, low, close)
+                        macd_value = 0.0
+                        if self.macd:
+                            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
+                            if macd_line is not None:
+                                macd_value = float(macd_line)
+
+                        mds_snapshot = None
+                        if config.get('indicator_type') == 'score_mds' and self.score_engine:
+                            try:
+                                mds_snapshot = self.score_engine.on_base_candle(Candle(high=float(high), low=float(low), close=float(close)))
+                                bot_state['mds_score'] = float(mds_snapshot.score)
+                                bot_state['mds_slope'] = float(mds_snapshot.slope)
+                                bot_state['mds_acceleration'] = float(mds_snapshot.acceleration)
+                                bot_state['mds_stability'] = float(mds_snapshot.stability)
+                                bot_state['mds_confidence'] = float(mds_snapshot.confidence)
+                                bot_state['mds_is_choppy'] = bool(mds_snapshot.is_choppy)
+                                bot_state['mds_direction'] = str(mds_snapshot.direction)
+                            except Exception as e:
+                                logger.error(f"[MDS] ScoreEngine update failed: {e}", exc_info=True)
+                                mds_snapshot = None
+
+                        if indicator_value:
+                            bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
+                            bot_state['macd_value'] = macd_value
+                            if signal == "GREEN":
+                                bot_state['signal_status'] = "buy"
+                            elif signal == "RED":
+                                bot_state['signal_status'] = "sell"
+                            else:
+                                bot_state['signal_status'] = "waiting"
+
+                        # Candle-close trading logic
+                        current_candle_time = datetime.now()
+                        if self.current_position:
+                            option_ltp = bot_state['current_option_ltp']
+                            sl_hit = await self.check_trailing_sl_on_close(option_ltp)
+                            if sl_hit:
+                                self.last_exit_candle_time = current_candle_time
+
+                        if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
+                            exited = await self.process_mds_on_close(mds_snapshot, close)
+                            if exited:
+                                self.last_exit_candle_time = current_candle_time
+                        else:
+                            if signal:
+                                prev_signal = bot_state.get('last_supertrend_signal')
+                                flipped = prev_signal is None or signal != prev_signal
+                                bot_state['last_supertrend_signal'] = signal
+                                exited = await self.process_signal_on_close(signal, close, flipped=flipped)
+                                if exited:
+                                    self.last_exit_candle_time = current_candle_time
+
+                    # Update simulated option pricing if needed
+                    if self.current_position:
+                        security_id = self.current_position.get('security_id', '')
+                        if security_id.startswith('SIM_'):
+                            strike = self.current_position.get('strike', 0)
+                            option_type = self.current_position.get('option_type', '')
+                            index_ltp = bot_state['index_ltp']
+                            if strike and index_ltp:
+                                distance_from_atm = abs(index_ltp - strike)
+                                if option_type == 'CE':
+                                    intrinsic = max(0, index_ltp - strike)
+                                else:
+                                    intrinsic = max(0, strike - index_ltp)
+                                atm_time_value = 150
+                                time_decay_factor = max(0, 1 - (distance_from_atm / 500))
+                                time_value = atm_time_value * time_decay_factor
+                                simulated_ltp = intrinsic + time_value
+                                tick_movement = random.choice([-0.10, -0.05, 0, 0.05, 0.10])
+                                simulated_ltp += tick_movement
+                                simulated_ltp = round(simulated_ltp / 0.05) * 0.05
+                                simulated_ltp = max(0.05, round(simulated_ltp, 2))
+                                bot_state['current_option_ltp'] = simulated_ltp
+
+                    await self.broadcast_state()
+                    speed = float(config.get('paper_replay_speed', 10.0) or 10.0)
+                    speed = max(0.1, min(100.0, speed))
+                    await asyncio.sleep(max(0.05, float(candle_interval) / speed))
+                    continue
+
+                # Fetch market data (skip if MarketDataService is active)
+                if self.dhan and not bot_state.get('market_data_service_active', False):
                     has_position = self.current_position is not None
                     option_security_id = None
                     
@@ -489,6 +707,22 @@ class TradingBot:
                             macd_line, _macd_cross = self.macd.add_candle(high, low, close)
                             if macd_line is not None:
                                 macd_value = float(macd_line)
+
+                        mds_snapshot = None
+                        if config.get('indicator_type') == 'score_mds' and self.score_engine:
+                            try:
+                                mds_snapshot = self.score_engine.on_base_candle(Candle(high=float(high), low=float(low), close=float(close)))
+
+                                bot_state['mds_score'] = float(mds_snapshot.score)
+                                bot_state['mds_slope'] = float(mds_snapshot.slope)
+                                bot_state['mds_acceleration'] = float(mds_snapshot.acceleration)
+                                bot_state['mds_stability'] = float(mds_snapshot.stability)
+                                bot_state['mds_confidence'] = float(mds_snapshot.confidence)
+                                bot_state['mds_is_choppy'] = bool(mds_snapshot.is_choppy)
+                                bot_state['mds_direction'] = str(mds_snapshot.direction)
+                            except Exception as e:
+                                logger.error(f"[MDS] ScoreEngine update failed: {e}", exc_info=True)
+                                mds_snapshot = None
                         
                         # Always update SuperTrend value
                         if indicator_value:
@@ -525,33 +759,45 @@ class TradingBot:
                                 close=close,
                                 supertrend_value=indicator_value,
                                 macd_value=macd_value,
-                                signal_status=bot_state['signal_status']
+                                signal_status=bot_state['signal_status'],
+                                interval_seconds=int(config.get('candle_interval', candle_interval) or candle_interval),
                             )
-                        
-                        if signal:
-                            prev_signal = bot_state.get('last_supertrend_signal')
-                            flipped = prev_signal is None or signal != prev_signal
-                            bot_state['last_supertrend_signal'] = signal
-                            
-                            # Check trailing SL/Target on candle close ONLY
-                            if self.current_position:
-                                option_ltp = bot_state['current_option_ltp']
-                                sl_hit = await self.check_trailing_sl_on_close(option_ltp)
-                                
-                                if sl_hit:
-                                    self.last_exit_candle_time = current_candle_time
-                            
-                            # Trading logic - entries/exits based on SuperTrend signal
+
+                        # Candle-close trailing SL/target check regardless of signal readiness
+                        if self.current_position:
+                            option_ltp = bot_state['current_option_ltp']
+                            sl_hit = await self.check_trailing_sl_on_close(option_ltp)
+                            if sl_hit:
+                                self.last_exit_candle_time = current_candle_time
+
+                        # Score-engine trading path (independent of SuperTrend signal emission)
+                        if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
                             can_trade = True
                             if self.last_exit_candle_time:
                                 time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
                                 if time_since_exit < candle_interval:
                                     can_trade = False
-                            
                             if can_trade:
-                                exited = await self.process_signal_on_close(signal, close, flipped=flipped)
+                                exited = await self.process_mds_on_close(mds_snapshot, close)
                                 if exited:
                                     self.last_exit_candle_time = current_candle_time
+                        else:
+                            if signal:
+                                prev_signal = bot_state.get('last_supertrend_signal')
+                                flipped = prev_signal is None or signal != prev_signal
+                                bot_state['last_supertrend_signal'] = signal
+
+                                # Trading logic - entries/exits based on SuperTrend signal
+                                can_trade = True
+                                if self.last_exit_candle_time:
+                                    time_since_exit = (current_candle_time - self.last_exit_candle_time).total_seconds()
+                                    if time_since_exit < candle_interval:
+                                        can_trade = False
+
+                                if can_trade:
+                                    exited = await self.process_signal_on_close(signal, close, flipped=flipped)
+                                    if exited:
+                                        self.last_exit_candle_time = current_candle_time
                     
                     # Reset candle for next period
                     candle_start_time = datetime.now()
@@ -618,6 +864,13 @@ class TradingBot:
                 "daily_trades": bot_state['daily_trades'],
                 "is_running": bot_state['is_running'],
                 "mode": bot_state['mode'],
+                "mds_score": bot_state.get('mds_score', 0.0),
+                "mds_slope": bot_state.get('mds_slope', 0.0),
+                "mds_acceleration": bot_state.get('mds_acceleration', 0.0),
+                "mds_stability": bot_state.get('mds_stability', 0.0),
+                "mds_confidence": bot_state.get('mds_confidence', 0.0),
+                "mds_is_choppy": bot_state.get('mds_is_choppy', False),
+                "mds_direction": bot_state.get('mds_direction', 'NONE'),
                 "trading_enabled": bool(config.get('trading_enabled', True)),
                 "selected_index": config['selected_index'],
                 "candle_interval": config['candle_interval'],
@@ -626,6 +879,154 @@ class TradingBot:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         })
+
+    async def process_mds_on_close(self, mds_snapshot, index_ltp: float) -> bool:
+        """Process score-engine snapshot on candle close.
+
+        Entry/exit are driven purely by MDS + safety gates.
+        """
+        exited = False
+        index_name = config['selected_index']
+        index_config = get_index_config(index_name)
+
+        # Exit logic first
+        if self.current_position:
+            position_type = self.current_position.get('option_type', '')
+            qty = int(self.current_position.get('qty') or 0)
+            if qty <= 0:
+                qty = int(config.get('order_qty', 1)) * index_config['lot_size']
+
+            # Respect min-hold to avoid churn
+            if self._min_hold_active():
+                return False
+
+            score = float(getattr(mds_snapshot, 'score', 0.0) or 0.0)
+            slope = float(getattr(mds_snapshot, 'slope', 0.0) or 0.0)
+
+            # Deterministic exits (score-only)
+            neutral = abs(score) <= 6.0
+
+            should_exit = False
+            reason = ""
+            if position_type == 'CE':
+                if score <= -10.0:
+                    should_exit = True
+                    reason = "MDS Reversal"
+                elif neutral:
+                    should_exit = True
+                    reason = "MDS Neutral"
+                elif slope <= -2.0 and score < 12.0:
+                    should_exit = True
+                    reason = "MDS Momentum Loss"
+            elif position_type == 'PE':
+                if score >= 10.0:
+                    should_exit = True
+                    reason = "MDS Reversal"
+                elif neutral:
+                    should_exit = True
+                    reason = "MDS Neutral"
+                elif slope >= 2.0 and score > -12.0:
+                    should_exit = True
+                    reason = "MDS Momentum Loss"
+
+            if should_exit:
+                exit_price = bot_state['current_option_ltp']
+                pnl = (exit_price - self.entry_price) * qty
+                logger.warning(f"[MDS] ✗ EXIT | {position_type} | Score={score:.2f} Slope={slope:.2f} | Reason={reason} | P&L=₹{pnl:.2f}")
+                closed = await self.close_position(exit_price, pnl, reason)
+                exited = bool(closed)
+                if closed:
+                    self.last_signal = None
+
+            return exited
+
+        # No position: entry logic
+
+        # Enforce order cooldown between any two orders
+        if not self._can_place_new_entry_order():
+            remaining = self._remaining_entry_cooldown()
+            logger.info(f"[MDS] Entry blocked - Order cooldown active ({remaining:.1f}s remaining)")
+            return False
+
+        if not can_take_new_trade():
+            return False
+
+        if bot_state['daily_trades'] >= config['max_trades_per_day']:
+            logger.info(f"[MDS] Max daily trades reached ({config['max_trades_per_day']})")
+            return False
+
+        # Check min_trade_gap protection (optional)
+        min_gap = config.get('min_trade_gap', 0)
+        if min_gap > 0 and self.last_trade_time:
+            time_since_last = (datetime.now() - self.last_trade_time).total_seconds()
+            if time_since_last < min_gap:
+                logger.debug(f"[MDS] Skipping - min trade gap not met ({time_since_last:.1f}s < {min_gap}s)")
+                return False
+
+        # Score-engine gates
+        if not getattr(mds_snapshot, 'ready', False):
+            logger.info("[MDS] Skipping - Engine not ready yet (warming up)")
+            return False
+
+        if bool(getattr(mds_snapshot, 'is_choppy', False)):
+            logger.info("[MDS] Skipping - Market is choppy")
+            return False
+
+        direction = str(getattr(mds_snapshot, 'direction', 'NONE') or 'NONE')
+        score = float(getattr(mds_snapshot, 'score', 0.0) or 0.0)
+        slope = float(getattr(mds_snapshot, 'slope', 0.0) or 0.0)
+        confidence = float(getattr(mds_snapshot, 'confidence', 0.0) or 0.0)
+
+        # Require meaningful score + slope
+        if direction == 'NONE' or abs(score) < 10.0 or abs(slope) < 1.0:
+            self._mds_last_direction = direction
+            self._mds_confirm_count = 0
+            return False
+
+        # Multi-candle confirmation
+        # In paper mode, use a looser confirm requirement so simulations can actually place trades
+        # under the synthetic price generator (which tends to be choppy).
+        confirm_needed = 1 if bot_state.get('mode') == 'paper' else 2
+        if self._mds_last_direction == direction:
+            self._mds_confirm_count += 1
+        else:
+            self._mds_last_direction = direction
+            self._mds_confirm_count = 1
+
+        if self._mds_confirm_count < confirm_needed:
+            logger.info(
+                f"[MDS] Arming entry ({self._mds_confirm_count}/{confirm_needed}) | "
+                f"Dir={direction} Score={score:.2f} Slope={slope:.2f} Conf={confidence:.2f}"
+            )
+            return False
+
+        # Confidence sizing (capped by risk-per-trade)
+        max_lots = int(config.get('order_qty', 1) or 1)
+        sizer = PositionSizingAgent(max_lots=max_lots)
+        sizing = sizer.size(
+            confidence=confidence,
+            risk_per_trade_rupees=float(config.get('risk_per_trade', 0) or 0),
+            sl_points=float(config.get('initial_stoploss', 0) or 0),
+            lot_size=int(index_config['lot_size']),
+        )
+
+        if sizing.final_lots < 1:
+            logger.info(f"[MDS] Skipping - Confidence sizing resulted in 0 lots | Conf={confidence:.2f}")
+            return False
+
+        option_type = 'CE' if direction == 'CE' else 'PE'
+        atm_strike = round_to_strike(index_ltp, index_name)
+
+        logger.info(
+            f"[MDS] ENTRY | {option_type} | Score={score:.2f} Slope={slope:.2f} Conf={confidence:.2f} | "
+            f"Lots={sizing.final_lots} (Desired={sizing.desired_lots}, RiskCap={sizing.risk_cap_lots}) | "
+            f"Index={index_name} LTP={index_ltp:.2f} ATM={atm_strike}"
+        )
+
+        await self.enter_position(option_type, atm_strike, index_ltp, override_lots=int(sizing.final_lots))
+        self.last_trade_time = datetime.now()
+        self._mds_confirm_count = 0
+        return False
     
     async def check_trailing_sl(self, current_ltp: float):
         """Update SL values - initial fixed SL then trails profit using step-based method"""
@@ -909,7 +1310,7 @@ class TradingBot:
         
         return exited
     
-    async def enter_position(self, option_type: str, strike: int, index_ltp: float):
+    async def enter_position(self, option_type: str, strike: int, index_ltp: float, override_lots: int | None = None):
         """Enter a new position with market validation"""
         # Soft pause: keep bot running (prices/indicators/exits), but block new entries
         if not config.get('trading_enabled', True):
@@ -942,19 +1343,27 @@ class TradingBot:
         
         index_name = config['selected_index']
         index_config = get_index_config(index_name)
-        
+
+        lots = int(config.get('order_qty', 1) or 1)
+        if override_lots is not None:
+            lots = max(1, int(override_lots))
+
         # Calculate position size based on risk (if enabled)
-        risk_per_trade = config.get('risk_per_trade', 0)
-        if risk_per_trade > 0 and config.get('initial_stoploss', 0) > 0:
-            # Position size = Risk Amount / (SL points * lot size * point value)
-            # For options: 1 point = 1 rupee per lot
-            sl_points = config['initial_stoploss']
+        risk_per_trade = float(config.get('risk_per_trade', 0) or 0)
+        sl_points = float(config.get('initial_stoploss', 0) or 0)
+        if risk_per_trade > 0 and sl_points > 0:
             max_lots = int(risk_per_trade / (sl_points * index_config['lot_size']))
-            lots = max(1, min(max_lots, int(config['order_qty'])))  # Between 1 and configured max lots
+            if max_lots < 1:
+                logger.warning(
+                    f"[POSITION] ✗ BLOCKED - risk_per_trade too low for 1 lot | Risk=₹{risk_per_trade} SL={sl_points} LotSize={index_config['lot_size']}"
+                )
+                return
+            lots = max(1, min(int(max_lots), int(lots)))
             qty = lots * index_config['lot_size']
-            logger.info(f"[POSITION] Size adjusted for risk: {lots} lots ({qty} qty) (Risk: ₹{risk_per_trade}, SL: {sl_points}pts)")
+            logger.info(
+                f"[POSITION] Size adjusted for risk: {lots} lots ({qty} qty) (Risk: ₹{risk_per_trade}, SL: {sl_points}pts)"
+            )
         else:
-            lots = int(config['order_qty'])
             qty = lots * index_config['lot_size']
         
         trade_id = f"T{datetime.now().strftime('%Y%m%d%H%M%S')}"

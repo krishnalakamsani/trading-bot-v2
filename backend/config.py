@@ -36,6 +36,15 @@ bot_state = {
     "htf_supertrend_signal": None,
     "htf_supertrend_value": 0.0,
     "htf_signal_status": "waiting",
+
+    # Score engine telemetry (MDS)
+    "mds_score": 0.0,
+    "mds_slope": 0.0,
+    "mds_acceleration": 0.0,
+    "mds_stability": 0.0,
+    "mds_confidence": 0.0,
+    "mds_is_choppy": False,
+    "mds_direction": "NONE",
 }
 
 # Configuration (can be updated from frontend)
@@ -52,6 +61,17 @@ config = {
     "trail_step": 0,  # Trailing step size (0 = disabled)
     # Profit Taking
     "target_points": 0,  # Target profit points (0 = disabled)
+
+    # Market data persistence
+    "store_tick_data": True,  # Persist index/option ticks to DB
+    "market_data_poll_seconds": 1.0,  # Quote polling interval
+    "tick_persist_interval_seconds": 1.0,  # DB write interval (throttle)
+    "pause_market_data_when_closed": False,
+
+    # Paper replay (use recorded DB candles instead of synthetic)
+    "paper_replay_enabled": False,
+    "paper_replay_date_ist": "",  # YYYY-MM-DD; empty means latest candles
+    "paper_replay_speed": 10.0,  # 1.0 = real-time, 10.0 = 10x faster
 
     # Testing
     "bypass_market_hours": False,  # If True: allow running logic outside 9:15-15:30 IST

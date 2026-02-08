@@ -58,6 +58,17 @@ class ConfigUpdate(BaseModel):
     # Testing
     bypass_market_hours: Optional[bool] = None  # If True: ignore market-hours gating (paper testing)
 
+    # Market data persistence
+    store_tick_data: Optional[bool] = None
+    market_data_poll_seconds: Optional[float] = None
+    tick_persist_interval_seconds: Optional[float] = None
+    pause_market_data_when_closed: Optional[bool] = None
+
+    # Paper replay
+    paper_replay_enabled: Optional[bool] = None
+    paper_replay_date_ist: Optional[str] = None  # YYYY-MM-DD
+    paper_replay_speed: Optional[float] = None
+
     # Indicator / strategy
     indicator_type: Optional[str] = None  # supertrend | supertrend_macd
     supertrend_period: Optional[int] = None

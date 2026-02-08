@@ -1,6 +1,76 @@
 version: '3.8'
 
 services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: niftyalgo-timescaledb
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=marketdata
+      - POSTGRES_USER=market
+      - POSTGRES_PASSWORD=market
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    networks:
+      - niftyalgo-network
+
+  market-data-service:
+    build:
+      context: ./market_data_service
+      dockerfile: Dockerfile
+    container_name: niftyalgo-market-data-service
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - POSTGRES_DSN=postgresql://market:market@timescaledb:5432/marketdata
+      - ENABLE_STREAMING=true
+      - POLL_SECONDS=1
+      - CANDLE_BASE_SECONDS=5
+      - SYMBOLS=NIFTY,BANKNIFTY,FINNIFTY,SENSEX
+      - PAUSE_WHEN_CLOSED=true
+      - DHAN_BASE_URL=${DHAN_BASE_URL:-}
+      - DHAN_HISTORICAL_URL=${DHAN_HISTORICAL_URL:-}
+      - DHAN_HISTORICAL_HEADERS_JSON=${DHAN_HISTORICAL_HEADERS_JSON:-}
+      - DHAN_EPOCH_IS_IST=true
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+    depends_on:
+      - timescaledb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - niftyalgo-network
+
+  market-data-backfill:
+    build:
+      context: ./market_data_service
+      dockerfile: Dockerfile
+    container_name: niftyalgo-market-data-backfill
+    restart: "no"
+    environment:
+      - POSTGRES_DSN=postgresql://market:market@timescaledb:5432/marketdata
+      - SYMBOLS=NIFTY,BANKNIFTY,FINNIFTY,SENSEX
+      - BACKFILL_YEARS=5
+      - BACKFILL_WINDOW_DAYS=25
+      - BACKFILL_MAX_CONCURRENCY=1
+      - DHAN_BASE_URL=${DHAN_BASE_URL:-}
+      - DHAN_HISTORICAL_URL=${DHAN_HISTORICAL_URL:-}
+      - DHAN_HISTORICAL_HEADERS_JSON=${DHAN_HISTORICAL_HEADERS_JSON:-}
+      - DHAN_EPOCH_IS_IST=true
+      - DHAN_CLIENT_ID=${DHAN_CLIENT_ID:-}
+      - DHAN_ACCESS_TOKEN=${DHAN_ACCESS_TOKEN:-}
+    depends_on:
+      - timescaledb
+    command: ["python", "-m", "app.backfill_main"]
+    networks:
+      - niftyalgo-network
+
   backend:
     build:
       context: ./backend
@@ -40,3 +110,6 @@ services:
 networks:
   niftyalgo-network:
     driver: bridge
+
+volumes:
+  timescale_data:

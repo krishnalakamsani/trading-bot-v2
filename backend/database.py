@@ -52,12 +52,25 @@ async def init_db():
                 timestamp TEXT,
                 candle_number INTEGER,
                 index_name TEXT,
+                interval_seconds INTEGER,
                 high REAL,
                 low REAL,
                 close REAL,
                 supertrend_value REAL,
                 macd_value REAL,
                 signal_status TEXT,
+                created_at TEXT
+            )
+        ''')
+
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS tick_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                index_name TEXT,
+                index_ltp REAL,
+                option_security_id TEXT,
+                option_ltp REAL,
                 created_at TEXT
             )
         ''')
@@ -95,6 +108,17 @@ async def init_db():
                 logger.info("[DB] Added index_name column to trades table")
         except Exception as e:
             logger.error(f"[DB] Migration error: {e}")
+
+        # Migration: add interval_seconds to candle_data if table existed before
+        try:
+            cursor = await db.execute("PRAGMA table_info(candle_data)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'interval_seconds' not in columns:
+                await db.execute("ALTER TABLE candle_data ADD COLUMN interval_seconds INTEGER")
+                await db.commit()
+                logger.info("[DB] Added interval_seconds column to candle_data table")
+        except Exception as e:
+            logger.error(f"[DB] Candle_data migration error: {e}")
 
 
 def _utc_now_iso() -> str:
@@ -319,6 +343,19 @@ async def update_trade_exit(trade_id: str, exit_time: str, exit_price: float, pn
     except Exception as e:
         logger.error(f"[DB] Error updating trade exit: {e}")
 
+
+async def update_trade_qty(trade_id: str, qty: int):
+    """Update trade quantity (used when scaling out partially)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                'UPDATE trades SET qty = ? WHERE trade_id = ?',
+                (int(qty), str(trade_id)),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"[DB] Error updating trade qty: {e}")
+
 async def get_trades(limit: int = None) -> list:
     """Get trade history
     
@@ -514,8 +551,17 @@ async def get_trade_analytics() -> dict:
             'daily_stats': daily_stats,
             'trades': trades
         }
-async def save_candle_data(candle_number: int, index_name: str, high: float, low: float, close: float, 
-                          supertrend_value: float, macd_value: float, signal_status: str):
+async def save_candle_data(
+    candle_number: int,
+    index_name: str,
+    high: float,
+    low: float,
+    close: float,
+    supertrend_value: float,
+    macd_value: float,
+    signal_status: str,
+    interval_seconds: int | None = None,
+):
     """Save candle data for analysis"""
     try:
         from datetime import datetime, timezone
@@ -524,13 +570,53 @@ async def save_candle_data(candle_number: int, index_name: str, high: float, low
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 '''INSERT INTO candle_data 
-                   (timestamp, candle_number, index_name, high, low, close, supertrend_value, macd_value, signal_status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                (timestamp, candle_number, index_name, high, low, close, supertrend_value, macd_value, signal_status, timestamp)
+                   (timestamp, candle_number, index_name, interval_seconds, high, low, close, supertrend_value, macd_value, signal_status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (
+                    timestamp,
+                    candle_number,
+                    index_name,
+                    int(interval_seconds) if interval_seconds is not None else None,
+                    high,
+                    low,
+                    close,
+                    supertrend_value,
+                    macd_value,
+                    signal_status,
+                    timestamp,
+                )
             )
             await db.commit()
     except Exception as e:
         logger.error(f"[DB] Error saving candle data: {e}")
+
+
+async def save_tick_data(
+    index_name: str,
+    index_ltp: float,
+    option_security_id: str | None = None,
+    option_ltp: float | None = None,
+    timestamp: str | None = None,
+):
+    """Persist raw tick data (index + optional option LTP) for later analysis/replay."""
+    try:
+        ts = str(timestamp or _utc_now_iso())
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                '''INSERT INTO tick_data (timestamp, index_name, index_ltp, option_security_id, option_ltp, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)''',
+                (
+                    ts,
+                    str(index_name),
+                    float(index_ltp or 0.0),
+                    str(option_security_id) if option_security_id else None,
+                    float(option_ltp) if option_ltp is not None else None,
+                    ts,
+                ),
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"[DB] Error saving tick data: {e}")
 
 async def get_candle_data(limit: int = 1000, index_name: str = None):
     """Retrieve candle data for analysis"""
@@ -550,4 +636,52 @@ async def get_candle_data(limit: int = 1000, index_name: str = None):
             return [dict(row) for row in reversed(rows)]  # Return in ascending order
     except Exception as e:
         logger.error(f"[DB] Error retrieving candle data: {e}")
+        return []
+
+
+async def get_candle_data_for_replay(index_name: str, interval_seconds: int, date_ist: str | None = None, limit: int = 20000) -> list:
+    """Fetch candles for replay.
+
+    Args:
+        index_name: e.g. 'NIFTY'
+        interval_seconds: e.g. 5/15/30/60/300/900
+        date_ist: 'YYYY-MM-DD' in IST. If omitted, returns latest `limit` candles.
+
+    Note: candle_data timestamps are stored in UTC ISO strings.
+    We approximate IST date matching by shifting UTC timestamp by +5:30 within SQLite.
+    """
+    try:
+        interval_seconds = int(interval_seconds)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+
+            if date_ist:
+                query = f'''
+                    SELECT *
+                    FROM candle_data
+                    WHERE index_name = ?
+                      AND (interval_seconds = ? OR interval_seconds IS NULL)
+                      AND date(datetime(timestamp), '+5 hours', '+30 minutes') = date(?)
+                    ORDER BY id ASC
+                    LIMIT {int(limit)}
+                '''
+                params = (str(index_name), int(interval_seconds), str(date_ist))
+                async with db.execute(query, params) as cursor:
+                    rows = await cursor.fetchall()
+            else:
+                query = f'''
+                    SELECT *
+                    FROM candle_data
+                    WHERE index_name = ?
+                      AND (interval_seconds = ? OR interval_seconds IS NULL)
+                    ORDER BY id DESC
+                    LIMIT {int(limit)}
+                '''
+                async with db.execute(query, (str(index_name), int(interval_seconds))) as cursor:
+                    rows = await cursor.fetchall()
+                rows = list(reversed(rows))
+
+            return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error(f"[DB] Error retrieving replay candles: {e}")
         return []

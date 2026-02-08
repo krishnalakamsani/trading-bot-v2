@@ -376,3 +376,158 @@ Implemented:
 
 Files:
 - `backend/server.py`
+
+---
+
+# B. Historical + Live Market Data Microservice (Dhan)
+
+This section designs a **production-grade historical + live market data system** for real-money options trading.
+
+## B1. High-Level Architecture Diagram (Text)
+
+```
+                 +----------------------------+
+                 |        Dhan API            |
+                 |  - quotes (poll/stream)    |
+                 |  - historical candles      |
+                 +-------------+--------------+
+                               |
+                 (rate-limit, retry, resume)
+                               |
+                +--------------v--------------------+
+                |       Market Data Service         |
+                |  FastAPI + workers                |
+                |-----------------------------------|
+                |  Backfill Job (5y)                |
+                |   - windowed/paginated fetch      |
+                |   - idempotent upserts            |
+                |   - gap detection + repair        |
+                |  Streaming Job (24/7)             |
+                |   - ticks -> 5s base candles      |
+                |   - watermark + lag tracking      |
+                +-----------------+-----------------+
+                                  |
+                                  | SQL (primary) + optional Parquet (cold)
+                                  |
+                 +----------------v-----------------+
+                 |         TimescaleDB (PG)         |
+                 |  candles hypertable              |
+                 |  ingest_watermarks (resume/lag)  |
+                 +----------------+-----------------+
+                                  |
+                   REST (low-latency reads)
+                                  |
+           +----------------------v----------------------+
+           |                 Trading Bot                  |
+           |  - consumes candle windows                    |
+           |  - never blocks on warm-up                     |
+           |  - places orders only                          |
+           +----------------------------------------------+
+```
+
+## B2. Why microservice (vs in-process collector)
+
+**Opinionated stance:** for real-money trading, a microservice is safer and easier to operate.
+
+- **Failure isolation:** trading loop can crash/restart without stopping data ingestion.
+- **Correctness boundary:** ingestion owns the candle truth; bot becomes a pure consumer.
+- **Independent scaling:** backfill and validation are heavy; streaming is latency-sensitive.
+- **Maintenance:** storage/ingestion changes don’t risk order-placement code.
+
+## B3. Data ingestion design
+
+### Backfill job (5 years)
+
+Backfill is a distinct worker that:
+
+- Iterates `symbol × timeframe_seconds`.
+- Pulls historical candles in fixed **time windows** (pagination-by-time) sized per timeframe.
+- Writes using **idempotent upserts** keyed by `(symbol, timeframe_seconds, ts)`.
+- Persists progress to `ingest_watermarks(kind='backfill')` so it can resume after restarts.
+
+### Streaming job (continuous append)
+
+Streaming should run 24/7 and:
+
+- Polls (or subscribes to) index LTP at 1s.
+- Builds **base 5s candles** deterministically by flooring timestamps to boundaries.
+- Upserts each closed candle and updates `ingest_watermarks(kind='stream')`.
+- Runs a periodic **gap detector** that checks recent periods and triggers historical fetch to repair missing candles.
+
+**Key guarantee:** “no gaps, no duplicates, no overlaps” comes from boundary alignment + unique keys + upserts.
+
+## B4. Storage recommendations (explicit, production)
+
+Primary (live + recent queries): **PostgreSQL + TimescaleDB**
+
+- Best correctness story (constraints + transactions).
+- Great range queries for strategies (symbol/tf/time).
+- Compression + retention are mature.
+
+Cold (optional, long-term): **S3 + Parquet**
+
+- Cheapest multi-year storage.
+- Best for offline analytics/backtests (Athena/Spark).
+
+Trade-offs summary:
+
+- **AWS Timestream:** great managed TSDB but stricter “exactly-once” constraints are less direct.
+- **TimescaleDB:** most control and simplest idempotent ingestion.
+- **InfluxDB:** solid TSDB but operationally another system and constraints differ.
+- **S3+Parquet:** not for low-latency bot reads; excellent for analytics/cold.
+
+## B5. Schema (example)
+
+- `candles(ts, symbol, timeframe_seconds, open, high, low, close, volume, source, ingested_at)`
+  - **Primary key:** `(symbol, timeframe_seconds, ts)`
+- `ingest_watermarks(symbol, timeframe_seconds, kind, last_ts, updated_at, details)`
+
+Recommended partitioning/indexing:
+
+- Timescale hypertable on `ts`, plus index `(symbol, timeframe_seconds, ts desc)`.
+- Compress 5s candles after 7–30 days; retain 90–180 days hot for 5s.
+
+## B6. Service API design
+
+REST is the default (your stack is Python + React):
+
+- `GET /v1/candles/last?symbol=NIFTY&timeframe_seconds=5&limit=5000`
+- `GET /v1/candles/range?symbol=NIFTY&timeframe_seconds=60&start=...&end=...`
+- `GET /v1/lag` (watermarks)
+- `GET /v1/health`
+
+Caching strategy:
+
+- In-memory cache for “last N” per (symbol, timeframe) within the service.
+- Add Redis only if you run multiple replicas.
+
+Latency considerations:
+
+- Strategies should **never** call Dhan directly; they read from the service/DB.
+
+## B7. Operational concerns
+
+- **Holidays / partial days:** do not synthesize candles; watermarks should remain stable.
+- **Exchange downtime:** gap detector will detect missing periods and repair after recovery.
+- **API outages:** ingestion fails safe; bot can detect lag via `/v1/lag` and fail closed.
+- **Clock sync:** enforce NTP and standardize on UTC in storage.
+- **Data drift/sanity:** validate monotonic timestamps and candle bounds; quarantine bad batches.
+
+## B8. Deployment model
+
+- Docker Compose for dev.
+- ECS/EC2 for production (Kubernetes only if you already run it).
+- Timescale on managed Postgres (preferred) or self-managed with backups.
+
+## B9. How the bot integrates
+
+- On strategy init, fetch a **pre-warmed** window (`last N candles`) and seed indicators immediately.
+- During runtime, consume new candles (or candle-close events) from the service.
+- Bot remains deterministic and does not block on indicator warm-up.
+
+## B10. Repo scaffold
+
+Scaffold added to this repository:
+
+- `market_data_service/` (FastAPI + Timescale schema + basic candle read APIs)
+- `docker-compose.yml` includes `timescaledb` and `market-data-service`

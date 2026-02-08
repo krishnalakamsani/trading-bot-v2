@@ -810,6 +810,7 @@ const Settings = () => {
                   <SelectContent>
                     <SelectItem value="supertrend">SuperTrend</SelectItem>
                     <SelectItem value="supertrend_macd">SuperTrend + MACD</SelectItem>
+                    <SelectItem value="score_mds">Score Engine (MDS)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

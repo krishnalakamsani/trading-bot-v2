@@ -82,6 +82,8 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+_market_data_service = None
+
 
 # Lifespan context manager
 @asynccontextmanager
@@ -89,7 +91,29 @@ async def lifespan(app: FastAPI):
     await init_db()
     await load_config()
     logger.info(f"[STARTUP] Database initialized, config loaded. Index={config.get('selected_index', 'NIFTY')}, Indicator=SuperTrend")
+
+    # Start independent market-data capture (runs even if bot is stopped)
+    global _market_data_service
+    if config.get("dhan_access_token") and config.get("dhan_client_id"):
+        try:
+            from dhan_api import DhanAPI
+            from market_data_service import MarketDataService
+
+            dhan = DhanAPI(config.get("dhan_access_token"), config.get("dhan_client_id"))
+            _market_data_service = MarketDataService(dhan)
+            await _market_data_service.start()
+        except Exception as e:
+            _market_data_service = None
+            logger.warning(f"[STARTUP] MarketDataService not started: {e}")
+
     yield
+
+    if _market_data_service is not None:
+        try:
+            await _market_data_service.stop()
+        except Exception:
+            pass
+        _market_data_service = None
     logger.info("[SHUTDOWN] Server shutting down")
 
 
@@ -146,8 +170,8 @@ def _validate_strategy_config(cfg: dict) -> None:
         raise ValueError("macd_fast must be less than macd_slow")
 
     ind = str(cfg.get("indicator_type", "supertrend_macd") or "").lower()
-    if ind not in ("supertrend", "supertrend_macd"):
-        raise ValueError("indicator_type must be 'supertrend' or 'supertrend_macd'")
+    if ind not in ("supertrend", "supertrend_macd", "score_mds"):
+        raise ValueError("indicator_type must be 'supertrend', 'supertrend_macd', or 'score_mds'")
 
     for key in ("min_trade_gap", "min_hold_seconds", "min_order_cooldown_seconds"):
         if key in cfg and cfg[key] is not None:

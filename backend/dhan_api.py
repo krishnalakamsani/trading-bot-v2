@@ -1,5 +1,8 @@
 # Dhan API wrapper
-from dhanhq import dhanhq
+try:
+    from dhanhq import dhanhq  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    dhanhq = None
 from datetime import datetime, timezone, timedelta
 import logging
 from config import bot_state
@@ -10,6 +13,10 @@ DEFAULT_FNO_SEGMENT = "NSE_FNO"
 
 class DhanAPI:
     def __init__(self, access_token: str, client_id: str):
+        if dhanhq is None:
+            raise RuntimeError(
+                "Dhan SDK not installed (missing 'dhanhq'). Install it to use live trading/quotes."
+            )
         self.access_token = access_token
         self.client_id = client_id
         self.dhan = dhanhq(client_id, access_token)

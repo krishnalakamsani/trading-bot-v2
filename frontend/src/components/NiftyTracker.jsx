@@ -57,6 +57,14 @@ const NiftyTracker = () => {
   const selectedIndex = config.selected_index || "NIFTY";
   const candleInterval = botStatus.candle_interval || config.candle_interval || 5;
 
+  const showMds = String(config?.indicator_type || "").toLowerCase() === "score_mds";
+  const mdsScore = Number(botStatus?.mds_score ?? 0);
+  const mdsConfidence = Number(botStatus?.mds_confidence ?? 0);
+  const mdsIsChoppy = Boolean(botStatus?.mds_is_choppy);
+  const mdsDirection = String(botStatus?.mds_direction || "NONE");
+  const mdsColorClass =
+    mdsScore > 6 ? "text-emerald-600" : mdsScore < -6 ? "text-red-600" : "text-gray-700";
+
   return (
     <div className="terminal-card" data-testid="nifty-tracker">
       <div className="terminal-card-header">
@@ -84,6 +92,21 @@ const NiftyTracker = () => {
               }) : "—"}
             </p>
           </div>
+
+          {/* MDS (Score Engine) */}
+          {showMds && (
+            <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-sm border border-gray-200">
+              <div>
+                <p className="label-text text-xs mb-1">MDS</p>
+                <p className={`text-xl font-mono font-bold ${mdsColorClass}`} data-testid="mds-score">
+                  {Number.isFinite(mdsScore) ? mdsScore.toFixed(1) : "—"}
+                </p>
+                <p className="text-[10px] text-gray-500 font-mono" data-testid="mds-meta">
+                  Conf {Number.isFinite(mdsConfidence) ? mdsConfidence.toFixed(2) : "—"} · {mdsIsChoppy ? "CHOP" : mdsDirection}
+                </p>
+              </div>
+            </div>
+          )}
 
           {/* SuperTrend */}
           <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-sm border border-gray-200">

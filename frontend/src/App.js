@@ -35,7 +35,16 @@ function App() {
     daily_max_loss_triggered: false,
     trading_enabled: true,
     selected_index: "NIFTY",
-    candle_interval: 5
+    candle_interval: 5,
+
+    // Score engine telemetry (MDS)
+    mds_score: 0,
+    mds_slope: 0,
+    mds_acceleration: 0,
+    mds_stability: 0,
+    mds_confidence: 0,
+    mds_is_choppy: false,
+    mds_direction: "NONE"
   });
   const [marketData, setMarketData] = useState({
     ltp: 0,
@@ -169,7 +178,15 @@ function App() {
               mode: update.mode,
               trading_enabled: update.trading_enabled,
               selected_index: update.selected_index,
-              candle_interval: update.candle_interval
+              candle_interval: update.candle_interval,
+
+              mds_score: update.mds_score ?? prev.mds_score,
+              mds_slope: update.mds_slope ?? prev.mds_slope,
+              mds_acceleration: update.mds_acceleration ?? prev.mds_acceleration,
+              mds_stability: update.mds_stability ?? prev.mds_stability,
+              mds_confidence: update.mds_confidence ?? prev.mds_confidence,
+              mds_is_choppy: update.mds_is_choppy ?? prev.mds_is_choppy,
+              mds_direction: update.mds_direction ?? prev.mds_direction
             }));
             setSummary(prev => ({
               ...prev,

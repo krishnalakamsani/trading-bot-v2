@@ -160,6 +160,17 @@ def get_config() -> dict:
         # Testing
         "bypass_market_hours": bool(config.get('bypass_market_hours', False)),
 
+        # Market data persistence
+        "store_tick_data": bool(config.get("store_tick_data", True)),
+        "market_data_poll_seconds": float(config.get("market_data_poll_seconds", 1.0) or 1.0),
+        "tick_persist_interval_seconds": float(config.get("tick_persist_interval_seconds", 1.0) or 1.0),
+        "pause_market_data_when_closed": bool(config.get("pause_market_data_when_closed", False)),
+
+        # Paper replay
+        "paper_replay_enabled": bool(config.get("paper_replay_enabled", False)),
+        "paper_replay_date_ist": str(config.get("paper_replay_date_ist", "") or ""),
+        "paper_replay_speed": float(config.get("paper_replay_speed", 10.0) or 10.0),
+
         # MTF filter
         "htf_filter_enabled": bool(config.get('htf_filter_enabled', True)),
         "htf_filter_timeframe": int(config.get('htf_filter_timeframe', 60)),
@@ -270,6 +281,44 @@ async def update_config_values(updates: dict) -> dict:
         config['bypass_market_hours'] = str(updates['bypass_market_hours']).lower() in ('true', '1', 'yes')
         updated_fields.append('bypass_market_hours')
         logger.warning(f"[CONFIG] Bypass market hours: {config['bypass_market_hours']}")
+
+    if updates.get("store_tick_data") is not None:
+        config["store_tick_data"] = bool(updates["store_tick_data"])
+        updated_fields.append("store_tick_data")
+        logger.info(f"[CONFIG] Store tick data: {config['store_tick_data']}")
+
+    if updates.get("market_data_poll_seconds") is not None:
+        v = float(updates["market_data_poll_seconds"])
+        config["market_data_poll_seconds"] = max(0.25, min(5.0, v))
+        updated_fields.append("market_data_poll_seconds")
+        logger.info(f"[CONFIG] Market data poll seconds: {config['market_data_poll_seconds']}")
+
+    if updates.get("tick_persist_interval_seconds") is not None:
+        v = float(updates["tick_persist_interval_seconds"])
+        config["tick_persist_interval_seconds"] = max(0.25, min(10.0, v))
+        updated_fields.append("tick_persist_interval_seconds")
+        logger.info(f"[CONFIG] Tick persist interval seconds: {config['tick_persist_interval_seconds']}")
+
+    if updates.get("pause_market_data_when_closed") is not None:
+        config["pause_market_data_when_closed"] = bool(updates["pause_market_data_when_closed"])
+        updated_fields.append("pause_market_data_when_closed")
+        logger.info(f"[CONFIG] Pause market data when closed: {config['pause_market_data_when_closed']}")
+
+    if updates.get("paper_replay_enabled") is not None:
+        config["paper_replay_enabled"] = bool(updates["paper_replay_enabled"])
+        updated_fields.append("paper_replay_enabled")
+        logger.warning(f"[CONFIG] Paper replay enabled: {config['paper_replay_enabled']}")
+
+    if updates.get("paper_replay_date_ist") is not None:
+        config["paper_replay_date_ist"] = str(updates["paper_replay_date_ist"] or "")
+        updated_fields.append("paper_replay_date_ist")
+        logger.info(f"[CONFIG] Paper replay date (IST): {config['paper_replay_date_ist']}")
+
+    if updates.get("paper_replay_speed") is not None:
+        v = float(updates["paper_replay_speed"])
+        config["paper_replay_speed"] = max(0.1, min(100.0, v))
+        updated_fields.append("paper_replay_speed")
+        logger.info(f"[CONFIG] Paper replay speed: {config['paper_replay_speed']}x")
         
     if updates.get('selected_index') is not None:
         new_index = updates['selected_index'].upper()
@@ -296,8 +345,8 @@ async def update_config_values(updates: dict) -> dict:
             logger.warning(f"[CONFIG] Invalid interval: {new_interval}. Valid: {valid_intervals}")
     
     if updates.get('indicator_type') is not None:
-        new_indicator = updates['indicator_type'].lower()
-        if new_indicator in ('supertrend', 'supertrend_macd'):
+        new_indicator = str(updates['indicator_type']).lower()
+        if new_indicator in ('supertrend', 'supertrend_macd', 'score_mds'):
             config['indicator_type'] = new_indicator
             updated_fields.append('indicator_type')
             logger.info(f"[CONFIG] Indicator changed to: {new_indicator}")
@@ -305,7 +354,7 @@ async def update_config_values(updates: dict) -> dict:
             bot = get_trading_bot()
             bot._initialize_indicator()
         else:
-            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd'")
+            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd', 'score_mds'")
 
     if updates.get('macd_confirmation_enabled') is not None:
         config['macd_confirmation_enabled'] = str(updates['macd_confirmation_enabled']).lower() in ('true', '1', 'yes')
