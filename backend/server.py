@@ -272,8 +272,19 @@ def _validate_strategy_config(cfg: dict) -> None:
         raise ValueError("macd_fast must be less than macd_slow")
 
     ind = str(cfg.get("indicator_type", "supertrend_macd") or "").lower()
-    if ind not in ("supertrend", "supertrend_macd", "score_mds"):
-        raise ValueError("indicator_type must be 'supertrend', 'supertrend_macd', or 'score_mds'")
+    if ind not in ("supertrend", "supertrend_macd", "supertrend_adx", "score_mds"):
+        raise ValueError("indicator_type must be 'supertrend', 'supertrend_macd', 'supertrend_adx', or 'score_mds'")
+
+    # ADX validation (used by supertrend_adx)
+    if "adx_period" in cfg and cfg["adx_period"] is not None:
+        v = int(cfg["adx_period"])
+        if v < 1 or v > 200:
+            raise ValueError("adx_period out of range")
+
+    if "adx_threshold" in cfg and cfg["adx_threshold"] is not None:
+        v = float(cfg["adx_threshold"])
+        if v < 0 or v > 100:
+            raise ValueError("adx_threshold out of range")
 
     for key in ("min_trade_gap", "min_hold_seconds", "min_order_cooldown_seconds"):
         if key in cfg and cfg[key] is not None:

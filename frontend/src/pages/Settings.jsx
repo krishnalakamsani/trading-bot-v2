@@ -51,6 +51,9 @@ const Settings = () => {
     config.macd_confirmation_enabled !== false
   );
 
+  const [adxPeriod, setAdxPeriod] = useState(config.adx_period || 14);
+  const [adxThreshold, setAdxThreshold] = useState(config.adx_threshold || 25);
+
   const [minTradeGap, setMinTradeGap] = useState(config.min_trade_gap || 0);
   const [tradeOnlyOnFlip, setTradeOnlyOnFlip] = useState(config.trade_only_on_flip !== false);
 
@@ -61,6 +64,12 @@ const Settings = () => {
   const [minOrderCooldownSeconds, setMinOrderCooldownSeconds] = useState(
     config.min_order_cooldown_seconds || 15
   );
+
+  const normalizedIndicatorType = String(indicatorType || "").trim().toLowerCase();
+  const indicatorUsesMacd = normalizedIndicatorType === "supertrend_macd" || normalizedIndicatorType === "score_mds";
+  const showMacdConfirmationToggle = normalizedIndicatorType === "supertrend_macd";
+  const showFlipAndHtfControls = normalizedIndicatorType !== "score_mds";
+  const indicatorUsesAdx = normalizedIndicatorType === "supertrend_adx";
 
   // Paper replay (testing)
   const [paperReplayEnabled, setPaperReplayEnabled] = useState(!!config.paper_replay_enabled);
@@ -104,6 +113,9 @@ const Settings = () => {
       setMacdSlow(config?.macd_slow || 26);
       setMacdSignal(config?.macd_signal || 9);
       setMacdConfirmationEnabled(config?.macd_confirmation_enabled !== false);
+
+      setAdxPeriod(config?.adx_period || 14);
+      setAdxThreshold(config?.adx_threshold || 25);
       setMinTradeGap(config?.min_trade_gap || 0);
       setTradeOnlyOnFlip(config?.trade_only_on_flip !== false);
       setHtfFilterEnabled(config?.htf_filter_enabled !== false);
@@ -159,6 +171,9 @@ const Settings = () => {
       macd_signal: macdSignal,
       macd_confirmation_enabled: macdConfirmationEnabled,
 
+      adx_period: adxPeriod,
+      adx_threshold: adxThreshold,
+
       min_trade_gap: minTradeGap,
       trade_only_on_flip: tradeOnlyOnFlip,
 
@@ -200,6 +215,9 @@ const Settings = () => {
       macd_slow: macdSlow,
       macd_signal: macdSignal,
       macd_confirmation_enabled: macdConfirmationEnabled,
+
+      adx_period: adxPeriod,
+      adx_threshold: adxThreshold,
 
       min_trade_gap: minTradeGap,
       trade_only_on_flip: tradeOnlyOnFlip,
@@ -692,6 +710,9 @@ const Settings = () => {
           <TabsContent value="strategy" className="space-y-4 mt-6 bg-white p-6 rounded-lg border border-gray-200">
             <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
               <div className="text-sm font-medium text-gray-900">Saved Strategies</div>
+              <div className="text-xs text-gray-500">
+                Strategy = saved snapshot of settings. Indicator controls entries; sizing/exits are in the Risk tab.
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div className="space-y-1">
                   <Label htmlFor="strategy-name" className="text-xs text-gray-600">Strategy Name</Label>
@@ -840,29 +861,41 @@ const Settings = () => {
                   <SelectContent>
                     <SelectItem value="supertrend">SuperTrend</SelectItem>
                     <SelectItem value="supertrend_macd">SuperTrend + MACD</SelectItem>
+                    <SelectItem value="supertrend_adx">SuperTrend + ADX</SelectItem>
                     <SelectItem value="score_mds">Score Engine (MDS)</SelectItem>
                   </SelectContent>
                 </Select>
+                <p className="text-xs text-gray-500">
+                  {normalizedIndicatorType === "score_mds"
+                    ? "Score Engine uses SuperTrend + MACD internally and handles confirmation."
+                    : normalizedIndicatorType === "supertrend_adx"
+                    ? "SuperTrend entries filtered by ADX (trend strength)."
+                    : normalizedIndicatorType === "supertrend"
+                    ? "SuperTrend-only entries (no MACD)."
+                    : "SuperTrend entries with MACD confirmation."}
+                </p>
               </div>
 
-              <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
-                <div>
-                  <Label htmlFor="macd-confirm-toggle" className="text-sm font-medium">
-                    MACD Confirmation
-                  </Label>
-                  <p className="text-xs text-gray-500">Require MACD alignment</p>
+              {showMacdConfirmationToggle && (
+                <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
+                  <div>
+                    <Label htmlFor="macd-confirm-toggle" className="text-sm font-medium">
+                      MACD Confirmation
+                    </Label>
+                    <p className="text-xs text-gray-500">Require MACD alignment</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-500">Off</span>
+                    <Switch
+                      id="macd-confirm-toggle"
+                      checked={!!macdConfirmationEnabled}
+                      onCheckedChange={setMacdConfirmationEnabled}
+                      data-testid="macd-confirm-toggle"
+                    />
+                    <span className="text-xs font-medium text-emerald-700">On</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-gray-500">Off</span>
-                  <Switch
-                    id="macd-confirm-toggle"
-                    checked={!!macdConfirmationEnabled}
-                    onCheckedChange={setMacdConfirmationEnabled}
-                    data-testid="macd-confirm-toggle"
-                  />
-                  <span className="text-xs font-medium text-emerald-700">On</span>
-                </div>
-              </div>
+              )}
 
               <div>
                 <Label htmlFor="supertrend-period">SuperTrend Period</Label>
@@ -891,44 +924,80 @@ const Settings = () => {
                 />
               </div>
 
-              <div>
-                <Label htmlFor="macd-fast">MACD Fast</Label>
-                <Input
-                  id="macd-fast"
-                  type="number"
-                  min="1"
-                  value={macdFast}
-                  onChange={(e) => setMacdFast(parseInt(e.target.value) || 1)}
-                  className="mt-1 rounded-sm"
-                  data-testid="macd-fast-input"
-                />
-              </div>
+              {indicatorUsesMacd && (
+                <>
+                  <div>
+                    <Label htmlFor="macd-fast">MACD Fast</Label>
+                    <Input
+                      id="macd-fast"
+                      type="number"
+                      min="1"
+                      value={macdFast}
+                      onChange={(e) => setMacdFast(parseInt(e.target.value) || 1)}
+                      className="mt-1 rounded-sm"
+                      data-testid="macd-fast-input"
+                    />
+                  </div>
 
-              <div>
-                <Label htmlFor="macd-slow">MACD Slow</Label>
-                <Input
-                  id="macd-slow"
-                  type="number"
-                  min="1"
-                  value={macdSlow}
-                  onChange={(e) => setMacdSlow(parseInt(e.target.value) || 1)}
-                  className="mt-1 rounded-sm"
-                  data-testid="macd-slow-input"
-                />
-              </div>
+                  <div>
+                    <Label htmlFor="macd-slow">MACD Slow</Label>
+                    <Input
+                      id="macd-slow"
+                      type="number"
+                      min="1"
+                      value={macdSlow}
+                      onChange={(e) => setMacdSlow(parseInt(e.target.value) || 1)}
+                      className="mt-1 rounded-sm"
+                      data-testid="macd-slow-input"
+                    />
+                  </div>
 
-              <div>
-                <Label htmlFor="macd-signal">MACD Signal</Label>
-                <Input
-                  id="macd-signal"
-                  type="number"
-                  min="1"
-                  value={macdSignal}
-                  onChange={(e) => setMacdSignal(parseInt(e.target.value) || 1)}
-                  className="mt-1 rounded-sm"
-                  data-testid="macd-signal-input"
-                />
-              </div>
+                  <div>
+                    <Label htmlFor="macd-signal">MACD Signal</Label>
+                    <Input
+                      id="macd-signal"
+                      type="number"
+                      min="1"
+                      value={macdSignal}
+                      onChange={(e) => setMacdSignal(parseInt(e.target.value) || 1)}
+                      className="mt-1 rounded-sm"
+                      data-testid="macd-signal-input"
+                    />
+                  </div>
+                </>
+              )}
+
+              {indicatorUsesAdx && (
+                <>
+                  <div>
+                    <Label htmlFor="adx-period">ADX Period</Label>
+                    <Input
+                      id="adx-period"
+                      type="number"
+                      min="1"
+                      value={adxPeriod}
+                      onChange={(e) => setAdxPeriod(parseInt(e.target.value) || 1)}
+                      className="mt-1 rounded-sm"
+                      data-testid="adx-period-input"
+                    />
+                  </div>
+
+                  <div>
+                    <Label htmlFor="adx-threshold">ADX Threshold</Label>
+                    <Input
+                      id="adx-threshold"
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={adxThreshold}
+                      onChange={(e) => setAdxThreshold(parseFloat(e.target.value) || 0)}
+                      className="mt-1 rounded-sm"
+                      data-testid="adx-threshold-input"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">Common: 20–25 for trend strength</p>
+                  </div>
+                </>
+              )}
 
               <div>
                 <Label htmlFor="min-trade-gap">Min Trade Gap (seconds)</Label>
@@ -944,56 +1013,62 @@ const Settings = () => {
                 <p className="text-xs text-gray-500 mt-1">0 = disabled</p>
               </div>
 
-              <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
-                <div>
-                  <Label htmlFor="trade-only-on-flip-toggle" className="text-sm font-medium">
-                    Trade Only On Flip
-                  </Label>
-                  <p className="text-xs text-gray-500">Entry only on SuperTrend flip</p>
+              {showFlipAndHtfControls && (
+                <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
+                  <div>
+                    <Label htmlFor="trade-only-on-flip-toggle" className="text-sm font-medium">
+                      Trade Only On Flip
+                    </Label>
+                    <p className="text-xs text-gray-500">Entry only on SuperTrend flip</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-500">Off</span>
+                    <Switch
+                      id="trade-only-on-flip-toggle"
+                      checked={!!tradeOnlyOnFlip}
+                      onCheckedChange={setTradeOnlyOnFlip}
+                      data-testid="trade-only-on-flip-toggle"
+                    />
+                    <span className="text-xs font-medium text-emerald-700">On</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-gray-500">Off</span>
-                  <Switch
-                    id="trade-only-on-flip-toggle"
-                    checked={!!tradeOnlyOnFlip}
-                    onCheckedChange={setTradeOnlyOnFlip}
-                    data-testid="trade-only-on-flip-toggle"
-                  />
-                  <span className="text-xs font-medium text-emerald-700">On</span>
-                </div>
-              </div>
+              )}
 
-              <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
-                <div>
-                  <Label htmlFor="htf-filter-toggle" className="text-sm font-medium">
-                    HTF Filter
-                  </Label>
-                  <p className="text-xs text-gray-500">Require higher TF alignment</p>
+              {showFlipAndHtfControls && (
+                <div className="flex items-center justify-between p-3 bg-gray-50 rounded-sm border border-gray-100">
+                  <div>
+                    <Label htmlFor="htf-filter-toggle" className="text-sm font-medium">
+                      HTF Filter
+                    </Label>
+                    <p className="text-xs text-gray-500">Require higher TF alignment</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-500">Off</span>
+                    <Switch
+                      id="htf-filter-toggle"
+                      checked={!!htfFilterEnabled}
+                      onCheckedChange={setHtfFilterEnabled}
+                      data-testid="htf-filter-toggle"
+                    />
+                    <span className="text-xs font-medium text-emerald-700">On</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-medium text-gray-500">Off</span>
-                  <Switch
-                    id="htf-filter-toggle"
-                    checked={!!htfFilterEnabled}
-                    onCheckedChange={setHtfFilterEnabled}
-                    data-testid="htf-filter-toggle"
-                  />
-                  <span className="text-xs font-medium text-emerald-700">On</span>
-                </div>
-              </div>
+              )}
 
-              <div>
-                <Label htmlFor="htf-filter-timeframe">HTF Timeframe (seconds)</Label>
-                <Input
-                  id="htf-filter-timeframe"
-                  type="number"
-                  min="5"
-                  value={htfFilterTimeframe}
-                  onChange={(e) => setHtfFilterTimeframe(parseInt(e.target.value) || 5)}
-                  className="mt-1 rounded-sm"
-                  data-testid="htf-filter-timeframe-input"
-                />
-              </div>
+              {showFlipAndHtfControls && !!htfFilterEnabled && (
+                <div>
+                  <Label htmlFor="htf-filter-timeframe">HTF Timeframe (seconds)</Label>
+                  <Input
+                    id="htf-filter-timeframe"
+                    type="number"
+                    min="5"
+                    value={htfFilterTimeframe}
+                    onChange={(e) => setHtfFilterTimeframe(parseInt(e.target.value) || 5)}
+                    className="mt-1 rounded-sm"
+                    data-testid="htf-filter-timeframe-input"
+                  />
+                </div>
+              )}
 
               <div>
                 <Label htmlFor="min-hold-seconds">Min Hold (seconds)</Label>

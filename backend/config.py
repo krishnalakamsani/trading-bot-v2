@@ -45,6 +45,9 @@ bot_state = {
     "mds_confidence": 0.0,
     "mds_is_choppy": False,
     "mds_direction": "NONE",
+
+    # ADX telemetry (for ST+ADX strategy)
+    "adx_value": 0.0,
 }
 
 # Configuration (can be updated from frontend)
@@ -124,16 +127,26 @@ config = {
     "paper_replay_date_ist": "",  # YYYY-MM-DD; empty means latest candles
     "paper_replay_speed": 10.0,  # 1.0 = real-time, 10.0 = 10x faster
 
+    # Paper mode quotes
+    # If True: when market is open, paper trades will use LIVE option LTP (via Dhan)
+    # instead of synthetic CE/PE premiums. This never places orders.
+    # Automatically falls back to synthetic pricing if Dhan is not configured.
+    "paper_use_live_option_quotes": _env_bool("PAPER_USE_LIVE_OPTION_QUOTES", True),
+
     # Testing
     "bypass_market_hours": False,  # If True: allow running logic outside 9:15-15:30 IST
     # Signal & Indicator Settings
-    "indicator_type": "supertrend_macd",  # supertrend | supertrend_macd
+    "indicator_type": "supertrend_macd",  # supertrend | supertrend_macd | supertrend_adx | score_mds
     "supertrend_period": 7,
     "supertrend_multiplier": 4,
     "macd_fast": 12,
     "macd_slow": 26,
     "macd_signal": 9,
     "macd_confirmation_enabled": True,
+
+    # ADX (used by supertrend_adx)
+    "adx_period": 14,
+    "adx_threshold": 25.0,
 
     # ScoreEngine (score_mds) bonus scoring knobs
     # These add small conviction bonuses on top of base MACD/HIST/ST scoring.
@@ -147,6 +160,11 @@ config = {
     "min_trade_gap": 0,  # Minimum seconds between trades (0 = disabled)
     "trade_only_on_flip": True,  # Only trade on SuperTrend direction change
     "risk_per_trade": 0,  # Risk amount per trade (0 = disabled, uses fixed qty)
+
+    # Position sizing
+    # If True: lots may be reduced based on risk_per_trade and initial_stoploss.
+    # If False: always use fixed lots from order_qty.
+    "enable_risk_based_lots": _env_bool("ENABLE_RISK_BASED_LOTS", False),
 
     # Multi-timeframe (MTF) filter
     "htf_filter_enabled": True,  # If True: require HTF SuperTrend direction alignment for LTF entries

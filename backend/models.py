@@ -39,6 +39,7 @@ class ConfigUpdate(BaseModel):
     trail_step: Optional[float] = None
     target_points: Optional[float] = None  # Target profit points for exit
     risk_per_trade: Optional[float] = None  # Risk amount per trade for position sizing
+    enable_risk_based_lots: Optional[bool] = None  # If True: allow risk_per_trade to reduce lots
     selected_index: Optional[str] = None
     candle_interval: Optional[int] = None  # Timeframe in seconds
     min_trade_gap: Optional[int] = None  # Minimum seconds between trades
@@ -70,13 +71,17 @@ class ConfigUpdate(BaseModel):
     paper_replay_speed: Optional[float] = None
 
     # Indicator / strategy
-    indicator_type: Optional[str] = None  # supertrend | supertrend_macd
+    indicator_type: Optional[str] = None  # supertrend | supertrend_macd | supertrend_adx | score_mds
     supertrend_period: Optional[int] = None
     supertrend_multiplier: Optional[float] = None
     macd_fast: Optional[int] = None
     macd_slow: Optional[int] = None
     macd_signal: Optional[int] = None
     macd_confirmation_enabled: Optional[bool] = None
+
+    # ADX
+    adx_period: Optional[int] = None
+    adx_threshold: Optional[float] = None
 
 class BotStatus(BaseModel):
     is_running: bool

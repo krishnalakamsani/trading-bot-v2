@@ -569,6 +569,9 @@ const SettingsPanel = ({ onClose }) => {
           <TabsContent value="strategy" className="space-y-4 mt-4 overflow-visible">
             <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
               <div className="text-sm font-medium text-gray-900">Saved Strategies</div>
+              <div className="text-xs text-gray-500">
+                Strategy = saved snapshot of settings. Indicator controls entries; sizing/exits are in the Risk tab.
+              </div>
 
               <input
                 ref={fileInputRef}

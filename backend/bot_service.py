@@ -183,6 +183,9 @@ def get_config() -> dict:
 
         # Trading control
         "trading_enabled": bool(config.get('trading_enabled', True)),
+        # ADX
+        "adx_period": int(config.get('adx_period', 14) or 14),
+        "adx_threshold": float(config.get('adx_threshold', 25.0) or 25.0),
     }
 
 
@@ -191,13 +194,17 @@ async def update_config_values(updates: dict) -> dict:
     logger.info(f"[CONFIG] Received updates: {list(updates.keys())}")
     updated_fields = []
     
+    creds_changed = False
+
     if updates.get('dhan_access_token') is not None:
-        config['dhan_access_token'] = str(updates['dhan_access_token'])
+        config['dhan_access_token'] = str(updates['dhan_access_token'] or '').strip()
         updated_fields.append('dhan_access_token')
-        
+        creds_changed = True
+
     if updates.get('dhan_client_id') is not None:
-        config['dhan_client_id'] = str(updates['dhan_client_id'])
+        config['dhan_client_id'] = str(updates['dhan_client_id'] or '').strip()
         updated_fields.append('dhan_client_id')
+        creds_changed = True
         
     if updates.get('order_qty') is not None:
         qty = int(updates['order_qty'])
@@ -244,6 +251,11 @@ async def update_config_values(updates: dict) -> dict:
         config['risk_per_trade'] = float(updates['risk_per_trade'])
         updated_fields.append('risk_per_trade')
         logger.info(f"[CONFIG] Risk per trade changed to: ₹{config['risk_per_trade']}")
+
+    if updates.get('enable_risk_based_lots') is not None:
+        config['enable_risk_based_lots'] = bool(updates['enable_risk_based_lots'])
+        updated_fields.append('enable_risk_based_lots')
+        logger.info(f"[CONFIG] Enable risk-based lots set to: {config['enable_risk_based_lots']}")
 
     if updates.get('trading_enabled') is not None:
         config['trading_enabled'] = bool(updates['trading_enabled'])
@@ -346,7 +358,7 @@ async def update_config_values(updates: dict) -> dict:
     
     if updates.get('indicator_type') is not None:
         new_indicator = str(updates['indicator_type']).lower()
-        if new_indicator in ('supertrend', 'supertrend_macd', 'score_mds'):
+        if new_indicator in ('supertrend', 'supertrend_macd', 'supertrend_adx', 'score_mds'):
             config['indicator_type'] = new_indicator
             updated_fields.append('indicator_type')
             logger.info(f"[CONFIG] Indicator changed to: {new_indicator}")
@@ -354,7 +366,7 @@ async def update_config_values(updates: dict) -> dict:
             bot = get_trading_bot()
             bot._initialize_indicator()
         else:
-            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd', 'score_mds'")
+            logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd', 'supertrend_adx', 'score_mds'")
 
     if updates.get('macd_confirmation_enabled') is not None:
         config['macd_confirmation_enabled'] = str(updates['macd_confirmation_enabled']).lower() in ('true', '1', 'yes')
@@ -368,6 +380,8 @@ async def update_config_values(updates: dict) -> dict:
         'macd_fast': int,
         'macd_slow': int,
         'macd_signal': int,
+        'adx_period': int,
+        'adx_threshold': float,
     }
     
     for param, param_type in indicator_params.items():
@@ -381,6 +395,19 @@ async def update_config_values(updates: dict) -> dict:
     
     await save_config()
     logger.info(f"[CONFIG] Updated: {updated_fields}")
+
+    # If credentials changed while bot is running in live mode, re-init Dhan immediately.
+    # This prevents the bot from continuing with a stale/None Dhan client.
+    if creds_changed and bot_state.get('mode') == 'live' and bot_state.get('is_running'):
+        try:
+            bot = get_trading_bot()
+            ok = bot.initialize_dhan()
+            if ok:
+                logger.info("[CONFIG] Dhan client re-initialized after credentials update")
+            else:
+                logger.warning("[CONFIG] Dhan client NOT initialized after credentials update (check creds)")
+        except Exception as e:
+            logger.warning(f"[CONFIG] Failed to re-initialize Dhan after credentials update: {e}")
     
     return {"status": "success", "message": "Configuration updated", "updated": updated_fields}
 
@@ -393,9 +420,31 @@ async def set_trading_mode(mode: str) -> dict:
     if mode not in ['paper', 'live']:
         return {"status": "error", "message": "Invalid mode. Use 'paper' or 'live'"}
     
+    # When switching to live mode, ensure credentials are present and initialize the client
+    # if the bot is already running.
+    if mode == 'live':
+        if not (str(config.get('dhan_access_token') or '').strip() and str(config.get('dhan_client_id') or '').strip()):
+            return {"status": "error", "message": "Dhan credentials not configured. Update credentials first."}
+
+        if bot_state.get('is_running'):
+            try:
+                bot = get_trading_bot()
+                if not bot.initialize_dhan():
+                    return {"status": "error", "message": "Failed to initialize Dhan API. Check credentials/SDK."}
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to initialize Dhan API: {e}"}
+
     bot_state['mode'] = mode
     logger.info(f"[CONFIG] Trading mode changed to: {mode}")
-    
+
+    # Safety: when switching to paper, drop any existing Dhan client reference.
+    if mode == 'paper':
+        try:
+            bot = get_trading_bot()
+            bot.dhan = None
+        except Exception:
+            pass
+
     return {"status": "success", "mode": mode}
 
 
