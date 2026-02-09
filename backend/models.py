@@ -83,6 +83,10 @@ class ConfigUpdate(BaseModel):
     adx_period: Optional[int] = None
     adx_threshold: Optional[float] = None
 
+    # Portfolio (multi-strategy)
+    portfolio_enabled: Optional[bool] = None
+    portfolio_strategy_ids: Optional[list[int]] = None
+
 class BotStatus(BaseModel):
     is_running: bool
     mode: str

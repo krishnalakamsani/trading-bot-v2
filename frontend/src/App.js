@@ -53,6 +53,7 @@ function App() {
     selected_index: "NIFTY"
   });
   const [position, setPosition] = useState(null);
+  const [portfolioPositions, setPortfolioPositions] = useState([]);
   const [trades, setTrades] = useState([]);
   const [summary, setSummary] = useState({
     total_trades: 0,
@@ -166,6 +167,26 @@ function App() {
           if (data.type === "state_update") {
             const update = data.data;
             const currentConfig = configRef.current;
+
+            if (Array.isArray(update.portfolio_positions)) {
+              const normalized = update.portfolio_positions.map((p) => {
+                const qty = Number(p?.qty ?? (currentConfig.order_qty * currentConfig.lot_size));
+                const entry = Number(p?.entry_price ?? 0);
+                const ltp = Number(p?.current_ltp ?? 0);
+                const unrealized = Number.isFinite(qty) ? (ltp - entry) * qty : 0;
+                return {
+                  ...p,
+                  qty,
+                  entry_price: entry,
+                  current_ltp: ltp,
+                  unrealized_pnl: unrealized,
+                };
+              });
+              setPortfolioPositions(normalized);
+            } else {
+              setPortfolioPositions([]);
+            }
+
             setMarketData({
               ltp: update.index_ltp,
               supertrend_signal: update.supertrend_signal,
@@ -331,6 +352,7 @@ function App() {
     marketData,
     niftyData: marketData, // Backward compatibility
     position,
+    portfolioPositions,
     trades,
     summary,
     logs,

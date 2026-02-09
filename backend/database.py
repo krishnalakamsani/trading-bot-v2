@@ -109,6 +109,17 @@ async def init_db():
         except Exception as e:
             logger.error(f"[DB] Migration error: {e}")
 
+        # Migration: Add strategy_id column if it doesn't exist
+        try:
+            cursor = await db.execute("PRAGMA table_info(trades)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            if 'strategy_id' not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN strategy_id TEXT DEFAULT ''")
+                await db.commit()
+                logger.info("[DB] Added strategy_id column to trades table")
+        except Exception as e:
+            logger.error(f"[DB] Trades migration error (strategy_id): {e}")
+
         # Migration: add interval_seconds to candle_data if table existed before
         try:
             cursor = await db.execute("PRAGMA table_info(candle_data)")
@@ -449,8 +460,8 @@ async def save_trade(trade_data: dict):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute('''
-                INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, strategy_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_data['trade_id'],
                 trade_data['entry_time'],
@@ -461,6 +472,7 @@ async def save_trade(trade_data: dict):
                 trade_data['qty'],
                 trade_data['mode'],
                 trade_data.get('index_name', 'NIFTY'),
+                str(trade_data.get('strategy_id', '') or ''),
                 trade_data['created_at']
             ))
             await db.commit()

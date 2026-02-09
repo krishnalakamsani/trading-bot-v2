@@ -4,7 +4,6 @@ import { AppContext } from "@/App";
 import TopBar from "@/components/TopBar";
 import PositionPanel from "@/components/PositionPanel";
 import ControlsPanel from "@/components/ControlsPanel";
-import NiftyTracker from "@/components/NiftyTracker";
 import TradesTable from "@/components/TradesTable";
 import DailySummary from "@/components/DailySummary";
 import LogsViewer from "@/components/LogsViewer";
@@ -31,9 +30,8 @@ const Dashboard = () => {
             <ControlsPanel />
           </div>
 
-          {/* Middle Column - Nifty Tracker & Trades (6 cols) */}
+          {/* Middle Column - Trades (6 cols) */}
           <div className="col-span-12 lg:col-span-6 flex flex-col gap-4">
-            <NiftyTracker />
             <TradesTable />
           </div>
 

@@ -3,9 +3,10 @@ import { AppContext } from "@/App";
 import { TrendingUp, TrendingDown, Clock, Target } from "lucide-react";
 
 const PositionPanel = () => {
-  const { position, config, botStatus } = useContext(AppContext);
+  const { position, portfolioPositions, config, botStatus } = useContext(AppContext);
+  const hasPortfolio = Array.isArray(portfolioPositions) && portfolioPositions.length > 0;
 
-  if (!position?.has_position) {
+  if (!hasPortfolio && !position?.has_position) {
     return (
       <div className="terminal-card" data-testid="position-panel">
         <div className="terminal-card-header">
@@ -19,10 +20,122 @@ const PositionPanel = () => {
           </div>
           <p className="text-sm text-gray-500">No open position</p>
           <p className="text-xs text-gray-400 mt-1">
-            {botStatus.is_running
-              ? "Waiting for signal..."
-              : "Start bot to begin trading"}
+            {botStatus?.is_running ? "Waiting for signal..." : "Start bot to begin trading"}
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (hasPortfolio) {
+    return (
+      <div className="terminal-card" data-testid="position-panel">
+        <div className="terminal-card-header">
+          <h2 className="text-sm font-semibold text-gray-900 font-[Manrope]">
+            Open Positions
+          </h2>
+          <span className="text-xs text-gray-500">
+            {portfolioPositions.length} open
+          </span>
+        </div>
+
+        <div className="p-4 space-y-3">
+          {portfolioPositions.map((p, idx) => {
+            const entry = Number(p?.entry_price ?? 0);
+            const ltp = Number(p?.current_ltp ?? 0);
+            const qty = Number(p?.qty ?? 0);
+            const pnl = Number(p?.unrealized_pnl ?? ((ltp - entry) * qty));
+            const isProfit = pnl >= 0;
+
+            const indexName = p?.index_name || config?.selected_index || "NIFTY";
+            const headerLabel = p?.strategy_name
+              ? p.strategy_name
+              : (p?.strategy_id ? `Strategy ${p.strategy_id}` : `Position ${idx + 1}`);
+
+            return (
+              <div key={p?.strategy_id ?? idx} className="border border-gray-100 rounded-sm">
+                <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100 bg-gray-50">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-gray-700">{headerLabel}</span>
+                    <span
+                      className={`status-badge ${
+                        p?.option_type === "CE" ? "status-running" : "status-error"
+                      }`}
+                    >
+                      {p?.option_type === "CE" ? (
+                        <TrendingUp className="w-3 h-3" />
+                      ) : (
+                        <TrendingDown className="w-3 h-3" />
+                      )}
+                      {indexName} {p?.option_type || "—"}
+                    </span>
+                  </div>
+
+                  <div
+                    className={`text-sm font-bold font-mono ${
+                      isProfit ? "text-emerald-600" : "text-red-600"
+                    }`}
+                  >
+                    {isProfit ? "+" : ""}₹{pnl.toFixed(2)}
+                  </div>
+                </div>
+
+                <div className="p-3 space-y-3">
+                  <div className="flex justify-between items-center">
+                    <div>
+                      <p className="label-text">Strike</p>
+                      <p className="text-base font-bold font-mono text-gray-900">
+                        {p?.strike ? Number(p.strike).toLocaleString("en-IN") : "—"}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="label-text">Expiry</p>
+                      <p className="text-sm font-mono text-gray-700">
+                        {p?.expiry
+                          ? new Date(p.expiry).toLocaleDateString("en-IN", {
+                              day: "2-digit",
+                              month: "short",
+                            })
+                          : "—"}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-gray-50 p-2 rounded-sm border border-gray-100">
+                      <p className="label-text">Entry Price</p>
+                      <p className="text-base font-mono font-semibold text-gray-900">
+                        ₹{Number.isFinite(entry) ? entry.toFixed(2) : "—"}
+                      </p>
+                    </div>
+                    <div className="bg-gray-50 p-2 rounded-sm border border-gray-100">
+                      <p className="label-text">Current LTP</p>
+                      <p className="text-base font-mono font-semibold text-gray-900">
+                        ₹{Number.isFinite(ltp) ? ltp.toFixed(2) : "—"}
+                      </p>
+                    </div>
+                  </div>
+
+                  {!!p?.trailing_sl && (
+                    <div className="flex items-center justify-between p-2 bg-amber-50 border border-amber-200 rounded-sm">
+                      <span className="text-xs font-medium text-amber-800">Trailing SL</span>
+                      <span className="text-sm font-mono font-semibold text-amber-900">
+                        ₹{Number(p.trailing_sl).toFixed(2)}
+                      </span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between text-xs text-gray-500">
+                    <span>Quantity: {qty || "—"}</span>
+                    <span className="flex items-center gap-1">
+                      <Clock className="w-3 h-3" />
+                      Active
+                    </span>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     );
@@ -114,9 +227,7 @@ const PositionPanel = () => {
         {/* Trailing SL */}
         {position.trailing_sl && (
           <div className="flex items-center justify-between p-2 bg-amber-50 border border-amber-200 rounded-sm">
-            <span className="text-xs font-medium text-amber-800">
-              Trailing SL
-            </span>
+            <span className="text-xs font-medium text-amber-800">Trailing SL</span>
             <span className="text-sm font-mono font-semibold text-amber-900">
               ₹{position.trailing_sl?.toFixed(2)}
             </span>

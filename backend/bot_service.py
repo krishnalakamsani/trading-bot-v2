@@ -186,6 +186,10 @@ def get_config() -> dict:
         # ADX
         "adx_period": int(config.get('adx_period', 14) or 14),
         "adx_threshold": float(config.get('adx_threshold', 25.0) or 25.0),
+
+        # Portfolio (multi-strategy)
+        "portfolio_enabled": bool(config.get('portfolio_enabled', False)),
+        "portfolio_strategy_ids": list(config.get('portfolio_strategy_ids', []) or []),
     }
 
 
@@ -367,6 +371,24 @@ async def update_config_values(updates: dict) -> dict:
             bot._initialize_indicator()
         else:
             logger.warning(f"[CONFIG] Invalid indicator: {new_indicator}. Supported: 'supertrend', 'supertrend_macd', 'supertrend_adx', 'score_mds'")
+
+    if updates.get('portfolio_enabled') is not None:
+        config['portfolio_enabled'] = bool(updates.get('portfolio_enabled'))
+        updated_fields.append('portfolio_enabled')
+        logger.warning(f"[CONFIG] Portfolio enabled: {config['portfolio_enabled']}")
+
+    if updates.get('portfolio_strategy_ids') is not None:
+        raw = updates.get('portfolio_strategy_ids')
+        ids: list[int] = []
+        if isinstance(raw, list):
+            for v in raw:
+                try:
+                    ids.append(int(v))
+                except Exception:
+                    continue
+        config['portfolio_strategy_ids'] = ids
+        updated_fields.append('portfolio_strategy_ids')
+        logger.info(f"[CONFIG] Portfolio strategy IDs: {config['portfolio_strategy_ids']}")
 
     if updates.get('macd_confirmation_enabled') is not None:
         config['macd_confirmation_enabled'] = str(updates['macd_confirmation_enabled']).lower() in ('true', '1', 'yes')

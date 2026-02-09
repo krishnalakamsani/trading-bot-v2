@@ -48,6 +48,10 @@ bot_state = {
 
     # ADX telemetry (for ST+ADX strategy)
     "adx_value": 0.0,
+
+    # Portfolio mode (multi-strategy)
+    # List of open positions keyed by strategy_id (for UI/backward-compat we still keep current_position)
+    "portfolio_positions": [],
 }
 
 # Configuration (can be updated from frontend)
@@ -178,6 +182,12 @@ config = {
 
     # Trading control
     "trading_enabled": True,  # If False: no new entries, but indicators/updates continue
+
+    # Portfolio mode (multi-strategy)
+    # If True: bot can run multiple strategies concurrently, with multiple open positions.
+    # Strategy definitions are loaded from the saved strategies table using portfolio_strategy_ids.
+    "portfolio_enabled": _env_bool("PORTFOLIO_ENABLED", False),
+    "portfolio_strategy_ids": [],  # list[int]
 }
 
 # SQLite Database path

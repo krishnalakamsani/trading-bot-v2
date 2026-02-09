@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
   SelectContent,
@@ -82,6 +83,12 @@ const Settings = () => {
   const [strategiesLoading, setStrategiesLoading] = useState(false);
   const fileInputRef = React.useRef(null);
 
+  // Portfolio (multi-strategy)
+  const [portfolioEnabled, setPortfolioEnabled] = useState(!!config.portfolio_enabled);
+  const [portfolioStrategyIds, setPortfolioStrategyIds] = useState(
+    Array.isArray(config.portfolio_strategy_ids) ? config.portfolio_strategy_ids : []
+  );
+
   const [saving, setSaving] = useState(false);
   const isFirstRender = React.useRef(true);
 
@@ -125,6 +132,11 @@ const Settings = () => {
 
       setPaperReplayEnabled(!!config?.paper_replay_enabled);
       setPaperReplayDateIst(String(config?.paper_replay_date_ist || ""));
+
+      setPortfolioEnabled(!!config?.portfolio_enabled);
+      setPortfolioStrategyIds(
+        Array.isArray(config?.portfolio_strategy_ids) ? config.portfolio_strategy_ids : []
+      );
 
       isFirstRender.current = false;
     }
@@ -204,6 +216,32 @@ const Settings = () => {
     setBypassMarketHoursUpdating(true);
     await updateConfig({ bypass_market_hours: !!checked });
     setBypassMarketHoursUpdating(false);
+  };
+
+  const togglePortfolioStrategy = (id, checked) => {
+    const numericId = Number(id);
+    if (!Number.isFinite(numericId)) return;
+    const next = new Set((portfolioStrategyIds || []).map((x) => Number(x)));
+    if (checked) next.add(numericId);
+    else next.delete(numericId);
+    setPortfolioStrategyIds(Array.from(next));
+  };
+
+  const handleSavePortfolioParams = async () => {
+    if (!canChangeRunContext) {
+      toast.error("Stop the bot and close position first");
+      return;
+    }
+    if (portfolioEnabled && (portfolioStrategyIds || []).length === 0) {
+      toast.error("Select at least one saved strategy");
+      return;
+    }
+    setSaving(true);
+    await updateConfig({
+      portfolio_enabled: !!portfolioEnabled,
+      portfolio_strategy_ids: (portfolioStrategyIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x)),
+    });
+    setSaving(false);
   };
 
   const buildStrategyConfig = () => {
@@ -848,6 +886,75 @@ const Settings = () => {
                 {!canApplyStrategy
                   ? "Stop the bot and close position to apply."
                   : "Apply requires bot stopped and no open position."}
+              </div>
+            </div>
+
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Portfolio Mode (Multiple strategies)</div>
+              <div className="text-xs text-gray-500">
+                Enable to run multiple saved strategies at the same time (paper mode). Choose which saved strategies to run.
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label className="text-xs text-gray-600">Enable Portfolio</Label>
+                  <div className="text-xs text-gray-500">Bot must be stopped to change this.</div>
+                </div>
+                <Switch
+                  checked={!!portfolioEnabled}
+                  onCheckedChange={(v) => canChangeRunContext && setPortfolioEnabled(!!v)}
+                  disabled={!canChangeRunContext}
+                  data-testid="portfolio-enabled-switch"
+                />
+              </div>
+
+              {portfolioEnabled ? (
+                <div className="space-y-2">
+                  <Label className="text-xs text-gray-600">Select strategies to run</Label>
+                  <div className="max-h-48 overflow-auto rounded-sm border border-gray-200 bg-white p-2">
+                    {(strategies || []).length === 0 ? (
+                      <div className="text-xs text-gray-500">No saved strategies found. Save one above first.</div>
+                    ) : (
+                      <div className="space-y-2">
+                        {(strategies || []).map((s) => {
+                          const sid = Number(s.id);
+                          const checked = (portfolioStrategyIds || []).map((x) => Number(x)).includes(sid);
+                          return (
+                            <label
+                              key={s.id}
+                              className="flex items-center gap-2 text-sm text-gray-800 cursor-pointer"
+                            >
+                              <Checkbox
+                                checked={checked}
+                                onCheckedChange={(v) => togglePortfolioStrategy(sid, v === true)}
+                                disabled={!canChangeRunContext}
+                                data-testid={`portfolio-strategy-${s.id}`}
+                              />
+                              <span className="text-sm">{s.name}</span>
+                              <span className="text-xs text-gray-400">(ID: {s.id})</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Note: Live paper option quotes require market open + credentials + bypass-hours OFF + replay OFF.
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="flex justify-end pt-2">
+                <Button
+                  onClick={handleSavePortfolioParams}
+                  disabled={saving}
+                  size="sm"
+                  className="rounded-sm btn-active"
+                  data-testid="save-portfolio-btn"
+                >
+                  <Save className="w-3 h-3 mr-1" />
+                  {saving ? "Saving..." : "Save Portfolio"}
+                </Button>
               </div>
             </div>
 
