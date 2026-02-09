@@ -54,6 +54,7 @@ function App() {
   });
   const [position, setPosition] = useState(null);
   const [portfolioPositions, setPortfolioPositions] = useState([]);
+  const [portfolioStrategiesState, setPortfolioStrategiesState] = useState([]);
   const [trades, setTrades] = useState([]);
   const [summary, setSummary] = useState({
     total_trades: 0,
@@ -185,6 +186,10 @@ function App() {
               setPortfolioPositions(normalized);
             } else {
               setPortfolioPositions([]);
+            }
+
+            if (Array.isArray(update.portfolio_strategies_state)) {
+              setPortfolioStrategiesState(update.portfolio_strategies_state);
             }
 
             setMarketData({
@@ -338,9 +343,18 @@ function App() {
     }
   };
 
-  const refreshLogs = async () => {
+  const refreshLogs = async (opts = {}) => {
     try {
-      const res = await axios.get(`${API}/logs?limit=100`);
+      const limit = Number.isFinite(Number(opts?.limit)) ? Number(opts.limit) : 100;
+      const level = typeof opts?.level === 'string' ? opts.level : 'all';
+      const strategyId = opts?.strategyId;
+
+      const params = new URLSearchParams();
+      params.set('limit', String(limit));
+      if (level && level !== 'all') params.set('level', String(level));
+      if (Number.isFinite(Number(strategyId))) params.set('strategy_id', String(Number(strategyId)));
+
+      const res = await axios.get(`${API}/logs?${params.toString()}`);
       setLogs(res.data);
     } catch (error) {
       console.error("Failed to refresh logs:", error);
@@ -353,6 +367,7 @@ function App() {
     niftyData: marketData, // Backward compatibility
     position,
     portfolioPositions,
+    portfolioStrategiesState,
     trades,
     summary,
     logs,

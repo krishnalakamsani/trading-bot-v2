@@ -1,5 +1,6 @@
-import React, { useContext, useState } from "react";
-import { AppContext } from "@/App";
+import React, { useContext, useEffect, useMemo, useState } from "react";
+import axios from "axios";
+import { API, AppContext } from "@/App";
 import { Play, Square, XCircle, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
@@ -25,7 +26,8 @@ const ControlsPanel = () => {
     updateConfig,
     setMode, 
     setSelectedIndex, 
-    setTimeframe 
+    setTimeframe,
+    fetchData,
   } = useContext(AppContext);
   
   const [loading, setLoading] = useState({
@@ -35,16 +37,120 @@ const ControlsPanel = () => {
     tradingEnabled: false,
   });
 
+  const [strategies, setStrategies] = useState([]);
+  const [strategiesLoading, setStrategiesLoading] = useState(false);
+  const [selectedStrategyId, setSelectedStrategyId] = useState("__current__");
+  const [strategyTouched, setStrategyTouched] = useState(false);
+
+  const portfolioIds = useMemo(() => {
+    const raw = Array.isArray(config?.portfolio_strategy_ids)
+      ? config.portfolio_strategy_ids
+      : [];
+    const seen = new Set();
+    const ids = [];
+    for (const x of raw) {
+      const n = Number(x);
+      if (!Number.isFinite(n)) continue;
+      const id = Math.trunc(n);
+      if (id <= 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }, [config?.portfolio_strategy_ids]);
+
+  const instances = useMemo(() => {
+    return config?.portfolio_instances && typeof config.portfolio_instances === "object"
+      ? config.portfolio_instances
+      : {};
+  }, [config?.portfolio_instances]);
+
+  const selectedStrategyIsSaved = selectedStrategyId !== "__current__";
+  const selectedStrategyInt = selectedStrategyIsSaved ? Number(selectedStrategyId) : null;
+  const selectedStrategyKey = selectedStrategyIsSaved ? String(Math.trunc(Number(selectedStrategyId))) : null;
+  const selectedStrategyActive = selectedStrategyIsSaved
+    ? (instances?.[selectedStrategyKey]?.active !== false)
+    : null;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        setStrategiesLoading(true);
+        const res = await axios.get(`${API}/strategies`);
+        if (cancelled) return;
+        setStrategies(Array.isArray(res.data) ? res.data : []);
+      } catch (e) {
+        if (cancelled) return;
+        setStrategies([]);
+      } finally {
+        if (cancelled) return;
+        setStrategiesLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Default selection: if portfolio already configured, pick first saved strategy.
+  useEffect(() => {
+    if (!strategyTouched && !selectedStrategyIsSaved && portfolioIds.length > 0) {
+      setSelectedStrategyId(String(portfolioIds[0]));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portfolioIds.join(",")]);
+
   const handleStart = async () => {
     setLoading((prev) => ({ ...prev, start: true }));
-    await startBot();
-    setLoading((prev) => ({ ...prev, start: false }));
+
+    try {
+      if (selectedStrategyIsSaved && Number.isFinite(selectedStrategyInt) && selectedStrategyInt > 0) {
+        const id = Math.trunc(selectedStrategyInt);
+
+        // Ensure portfolio is enabled and the selected strategy is included.
+        // Keep this control simple: starting from Controls runs the selected strategy.
+        await updateConfig({
+          portfolio_enabled: true,
+          portfolio_strategy_ids: [id],
+        });
+
+        // Activate the strategy instance and set its mode based on current toggle.
+        await axios.patch(`${API}/portfolio/strategies/${id}/instance`, {
+          active: true,
+          mode: botStatus?.mode === "live" ? "live" : "paper",
+        });
+
+        if (!botStatus.is_running) {
+          await startBot();
+        } else {
+          await fetchData();
+        }
+      } else {
+        // Backward-compatible: start the bot (single strategy mode)
+        await startBot();
+      }
+    } finally {
+      setLoading((prev) => ({ ...prev, start: false }));
+    }
   };
 
   const handleStop = async () => {
     setLoading((prev) => ({ ...prev, stop: true }));
-    await stopBot();
-    setLoading((prev) => ({ ...prev, stop: false }));
+    try {
+      if (selectedStrategyIsSaved && Number.isFinite(selectedStrategyInt) && selectedStrategyInt > 0) {
+        const id = Math.trunc(selectedStrategyInt);
+        await axios.post(`${API}/portfolio/strategies/${id}/stop`);
+        await fetchData();
+      } else {
+        await stopBot();
+      }
+    } finally {
+      setLoading((prev) => ({ ...prev, stop: false }));
+    }
   };
 
   const handleSquareOff = async () => {
@@ -73,6 +179,7 @@ const ControlsPanel = () => {
 
   const canChangeMode = !position?.has_position;
   const canChangeSettings = !botStatus.is_running && !position?.has_position;
+  const portfolioEnabled = !!config?.portfolio_enabled;
 
   // Get selected index info
   const selectedIndexInfo = indices.find(i => i.name === (config.selected_index || "NIFTY")) || {};
@@ -95,66 +202,106 @@ const ControlsPanel = () => {
       </div>
 
       <div className="p-4 space-y-4">
-        {/* Index Selection */}
+        {/* Strategy Selection */}
         <div className="space-y-2">
-          <Label className="text-xs font-medium text-gray-600">Index</Label>
+          <Label className="text-xs font-medium text-gray-600">Strategy</Label>
           <Select
-            value={config.selected_index || "NIFTY"}
-            onValueChange={handleIndexChange}
-            disabled={!canChangeSettings}
+            value={selectedStrategyId}
+            onValueChange={(v) => {
+              setStrategyTouched(true);
+              setSelectedStrategyId(v);
+            }}
+            disabled={strategiesLoading}
           >
-            <SelectTrigger className="w-full rounded-sm" data-testid="index-select">
-              <SelectValue placeholder="Select Index" />
+            <SelectTrigger className="w-full rounded-sm" data-testid="strategy-select">
+              <SelectValue placeholder={strategiesLoading ? "Loading..." : "Select Strategy"} />
             </SelectTrigger>
             <SelectContent>
-              {indices.map((index) => (
-                <SelectItem key={index.name} value={index.name}>
-                  <div className="flex items-center justify-between w-full">
-                    <span>{index.name}</span>
-                    <span className="text-xs text-gray-400 ml-2">
-                      Lot: {index.lot_size}
-                    </span>
-                  </div>
+              <SelectItem value="__current__">Use current settings</SelectItem>
+              {(strategies || []).map((s) => (
+                <SelectItem key={s.id} value={String(s.id)}>
+                  {s.name || `Strategy ${s.id}`}
                 </SelectItem>
               ))}
             </SelectContent>
           </Select>
-          {selectedIndexInfo.expiry_type && (
+          {selectedStrategyIsSaved && (
             <p className="text-xs text-gray-500">
-              Expiry: {getExpiryLabel(selectedIndexInfo)}
+              Selected: ID {selectedStrategyKey} · {selectedStrategyActive === false ? "Paused" : "Active"}
             </p>
           )}
         </div>
 
-        {/* Timeframe Selection */}
-        <div className="space-y-2">
-          <Label className="text-xs font-medium text-gray-600">Timeframe</Label>
-          <Select
-            value={String(config.candle_interval || 5)}
-            onValueChange={handleTimeframeChange}
-            disabled={!canChangeSettings}
-          >
-            <SelectTrigger className="w-full rounded-sm" data-testid="timeframe-select">
-              <SelectValue placeholder="Select Timeframe" />
-            </SelectTrigger>
-            <SelectContent>
-              {timeframes.map((tf) => (
-                <SelectItem key={tf.value} value={String(tf.value)}>
-                  {tf.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          {!canChangeSettings && (
-            <p className="text-xs text-amber-600">Stop bot to change settings</p>
-          )}
-        </div>
+        {portfolioEnabled ? (
+          <div className="p-3 bg-gray-50 rounded-sm border border-gray-100">
+            <p className="text-xs text-gray-600">
+              Portfolio mode: set per-strategy Index &amp; Timeframe in Running Strategies.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Index Selection */}
+            <div className="space-y-2">
+              <Label className="text-xs font-medium text-gray-600">Index</Label>
+              <Select
+                value={config.selected_index || "NIFTY"}
+                onValueChange={handleIndexChange}
+                disabled={!canChangeSettings}
+              >
+                <SelectTrigger className="w-full rounded-sm" data-testid="index-select">
+                  <SelectValue placeholder="Select Index" />
+                </SelectTrigger>
+                <SelectContent>
+                  {indices.map((index) => (
+                    <SelectItem key={index.name} value={index.name}>
+                      <div className="flex items-center justify-between w-full">
+                        <span>{index.name}</span>
+                        <span className="text-xs text-gray-400 ml-2">
+                          Lot: {index.lot_size}
+                        </span>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {selectedIndexInfo.expiry_type && (
+                <p className="text-xs text-gray-500">
+                  Expiry: {getExpiryLabel(selectedIndexInfo)}
+                </p>
+              )}
+            </div>
+
+            {/* Timeframe Selection */}
+            <div className="space-y-2">
+              <Label className="text-xs font-medium text-gray-600">Timeframe</Label>
+              <Select
+                value={String(config.candle_interval || 5)}
+                onValueChange={handleTimeframeChange}
+                disabled={!canChangeSettings}
+              >
+                <SelectTrigger className="w-full rounded-sm" data-testid="timeframe-select">
+                  <SelectValue placeholder="Select Timeframe" />
+                </SelectTrigger>
+                <SelectContent>
+                  {timeframes.map((tf) => (
+                    <SelectItem key={tf.value} value={String(tf.value)}>
+                      {tf.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!canChangeSettings && (
+                <p className="text-xs text-amber-600">Stop bot to change settings</p>
+              )}
+            </div>
+          </>
+        )}
 
         {/* Start/Stop Buttons */}
         <div className="grid grid-cols-2 gap-2">
           <Button
             onClick={handleStart}
-            disabled={botStatus.is_running || loading.start}
+            disabled={loading.start}
             className="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-sm btn-active"
             data-testid="start-bot-btn"
           >
@@ -168,7 +315,7 @@ const ControlsPanel = () => {
 
           <Button
             onClick={handleStop}
-            disabled={!botStatus.is_running || loading.stop}
+            disabled={loading.stop || (!selectedStrategyIsSaved && !botStatus.is_running)}
             variant="outline"
             className="w-full h-10 rounded-sm btn-active border-gray-300"
             data-testid="stop-bot-btn"

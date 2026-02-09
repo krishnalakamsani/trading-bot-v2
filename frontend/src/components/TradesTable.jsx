@@ -6,9 +6,31 @@ import { TrendingUp, TrendingDown } from "lucide-react";
 const TradesTable = () => {
   const { trades } = useContext(AppContext);
 
-  const formatTime = (isoString) => {
-    if (!isoString) return "—";
-    const date = new Date(isoString);
+  const isTimeOnly = (value) => {
+    if (typeof value !== "string") return false;
+    return /^\d{2}:\d{2}:\d{2}$/.test(value.trim());
+  };
+
+  const toDate = (value) => {
+    if (!value) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    return d;
+  };
+
+  const getEntryDate = (trade) => {
+    const raw = trade?.entry_time;
+    if (isTimeOnly(raw)) {
+      return toDate(trade?.created_at) || toDate(trade?.exit_time);
+    }
+    return toDate(raw) || toDate(trade?.created_at) || toDate(trade?.exit_time);
+  };
+
+  const formatTime = (trade) => {
+    const raw = trade?.entry_time;
+    if (isTimeOnly(raw)) return raw;
+    const date = getEntryDate(trade);
+    if (!date) return "—";
     return date.toLocaleTimeString("en-IN", {
       hour: "2-digit",
       minute: "2-digit",
@@ -16,9 +38,9 @@ const TradesTable = () => {
     });
   };
 
-  const formatDate = (isoString) => {
-    if (!isoString) return "";
-    const date = new Date(isoString);
+  const formatDate = (trade) => {
+    const date = getEntryDate(trade);
+    if (!date) return "";
     return date.toLocaleDateString("en-IN", {
       day: "2-digit",
       month: "short",
@@ -63,9 +85,9 @@ const TradesTable = () => {
                     data-testid={`trade-row-${index}`}
                   >
                     <td className="font-mono text-xs">
-                      <div>{formatDate(trade.entry_time)}</div>
+                      <div>{formatDate(trade)}</div>
                       <div className="text-gray-500">
-                        {formatTime(trade.entry_time)}
+                        {formatTime(trade)}
                       </div>
                     </td>
                     <td>

@@ -8,6 +8,41 @@ const TopBar = ({ onSettingsClick }) => {
   const { botStatus, wsConnected, config } = useContext(AppContext);
   const navigate = useNavigate();
 
+  const portfolioEnabled = !!config?.portfolio_enabled;
+  const portfolioIdsRaw = Array.isArray(config?.portfolio_strategy_ids)
+    ? config.portfolio_strategy_ids
+    : [];
+
+  const portfolioIds = React.useMemo(() => {
+    const seen = new Set();
+    const ids = [];
+    for (const x of portfolioIdsRaw) {
+      const n = Number(x);
+      if (!Number.isFinite(n)) continue;
+      const id = Math.trunc(n);
+      if (id <= 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }, [portfolioIdsRaw]);
+
+  const activePortfolioIds = React.useMemo(() => {
+    if (!portfolioEnabled) return [];
+    const inst = config?.portfolio_instances && typeof config.portfolio_instances === "object"
+      ? config.portfolio_instances
+      : {};
+    return (portfolioIds || []).filter((id) => {
+      const key = String(id);
+      const cfg = inst?.[key];
+      if (!cfg || typeof cfg !== "object") return true;
+      return cfg.active !== false;
+    });
+  }, [portfolioEnabled, portfolioIds, config?.portfolio_instances]);
+
+  const strategyCount = portfolioEnabled ? activePortfolioIds.length : 1;
+
   // Format timeframe for display
   const formatTimeframe = (seconds) => {
     if (!seconds) return "5s";
@@ -87,6 +122,19 @@ const TopBar = ({ onSettingsClick }) => {
           data-testid="mode-badge"
         >
           {botStatus.mode === "live" ? "LIVE" : "PAPER"}
+        </div>
+
+        {/* Strategies Count */}
+        <div
+          className="status-badge status-info"
+          data-testid="strategies-badge"
+          title={
+            portfolioEnabled
+              ? `Portfolio enabled. Active strategy IDs: ${(activePortfolioIds || []).join(", ") || "—"}`
+              : "Single strategy mode"
+          }
+        >
+          {portfolioEnabled ? "STRATS" : "STRAT"}: {strategyCount}
         </div>
 
         {/* Market Status - PROMINENT */}

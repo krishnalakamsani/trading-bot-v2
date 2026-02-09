@@ -501,7 +501,7 @@ const Settings = () => {
       {/* Content */}
       <div className="max-w-6xl mx-auto p-4 lg:p-6">
         <Tabs defaultValue="risk" className="w-full">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-5">
             <TabsTrigger value="credentials" className="text-xs">
               <Key className="w-3 h-3 mr-1" />
               API Keys
@@ -512,6 +512,12 @@ const Settings = () => {
             </TabsTrigger>
             <TabsTrigger value="strategy" className="text-xs">
               Strategy
+            </TabsTrigger>
+            <TabsTrigger value="portfolio" className="text-xs">
+              Portfolio
+            </TabsTrigger>
+            <TabsTrigger value="testing" className="text-xs">
+              Testing
             </TabsTrigger>
           </TabsList>
 
@@ -889,75 +895,6 @@ const Settings = () => {
               </div>
             </div>
 
-            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
-              <div className="text-sm font-medium text-gray-900">Portfolio Mode (Multiple strategies)</div>
-              <div className="text-xs text-gray-500">
-                Enable to run multiple saved strategies at the same time (paper mode). Choose which saved strategies to run.
-              </div>
-
-              <div className="flex items-center justify-between">
-                <div className="space-y-0.5">
-                  <Label className="text-xs text-gray-600">Enable Portfolio</Label>
-                  <div className="text-xs text-gray-500">Bot must be stopped to change this.</div>
-                </div>
-                <Switch
-                  checked={!!portfolioEnabled}
-                  onCheckedChange={(v) => canChangeRunContext && setPortfolioEnabled(!!v)}
-                  disabled={!canChangeRunContext}
-                  data-testid="portfolio-enabled-switch"
-                />
-              </div>
-
-              {portfolioEnabled ? (
-                <div className="space-y-2">
-                  <Label className="text-xs text-gray-600">Select strategies to run</Label>
-                  <div className="max-h-48 overflow-auto rounded-sm border border-gray-200 bg-white p-2">
-                    {(strategies || []).length === 0 ? (
-                      <div className="text-xs text-gray-500">No saved strategies found. Save one above first.</div>
-                    ) : (
-                      <div className="space-y-2">
-                        {(strategies || []).map((s) => {
-                          const sid = Number(s.id);
-                          const checked = (portfolioStrategyIds || []).map((x) => Number(x)).includes(sid);
-                          return (
-                            <label
-                              key={s.id}
-                              className="flex items-center gap-2 text-sm text-gray-800 cursor-pointer"
-                            >
-                              <Checkbox
-                                checked={checked}
-                                onCheckedChange={(v) => togglePortfolioStrategy(sid, v === true)}
-                                disabled={!canChangeRunContext}
-                                data-testid={`portfolio-strategy-${s.id}`}
-                              />
-                              <span className="text-sm">{s.name}</span>
-                              <span className="text-xs text-gray-400">(ID: {s.id})</span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                  <div className="text-xs text-gray-500">
-                    Note: Live paper option quotes require market open + credentials + bypass-hours OFF + replay OFF.
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="flex justify-end pt-2">
-                <Button
-                  onClick={handleSavePortfolioParams}
-                  disabled={saving}
-                  size="sm"
-                  className="rounded-sm btn-active"
-                  data-testid="save-portfolio-btn"
-                >
-                  <Save className="w-3 h-3 mr-1" />
-                  {saving ? "Saving..." : "Save Portfolio"}
-                </Button>
-              </div>
-            </div>
-
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label className="text-xs font-medium text-gray-600">Indicator Type</Label>
@@ -1207,6 +1144,101 @@ const Settings = () => {
             </div>
 
             <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Strategy Settings</div>
+              <div className="text-xs text-gray-500">
+                Build strategy parameters here. Portfolio selection is in the Portfolio tab; replay/bypass are in Testing.
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-4 border-t border-gray-100">
+              <Button
+                onClick={handleSaveStrategyParams}
+                disabled={saving}
+                size="sm"
+                className="rounded-sm btn-active"
+                data-testid="save-strategy-params-btn"
+              >
+                <Save className="w-3 h-3 mr-1" />
+                {saving ? "Saving..." : "Save Strategy Settings"}
+              </Button>
+            </div>
+          </TabsContent>
+
+          {/* Portfolio Tab */}
+          <TabsContent value="portfolio" className="space-y-4 mt-6 bg-white p-6 rounded-lg border border-gray-200">
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
+              <div className="text-sm font-medium text-gray-900">Portfolio Mode (Multiple strategies)</div>
+              <div className="text-xs text-gray-500">
+                Enable to run multiple saved strategies at the same time (paper mode). Choose which saved strategies to run.
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label className="text-xs text-gray-600">Enable Portfolio</Label>
+                  <div className="text-xs text-gray-500">Bot must be stopped to change this.</div>
+                </div>
+                <Switch
+                  checked={!!portfolioEnabled}
+                  onCheckedChange={(v) => canChangeRunContext && setPortfolioEnabled(!!v)}
+                  disabled={!canChangeRunContext}
+                  data-testid="portfolio-enabled-switch"
+                />
+              </div>
+
+              {portfolioEnabled ? (
+                <div className="space-y-2">
+                  <Label className="text-xs text-gray-600">Select strategies to run</Label>
+                  <div className="max-h-48 overflow-auto rounded-sm border border-gray-200 bg-white p-2">
+                    {(strategies || []).length === 0 ? (
+                      <div className="text-xs text-gray-500">No saved strategies found. Save one in the Strategy tab first.</div>
+                    ) : (
+                      <div className="space-y-2">
+                        {(strategies || []).map((s) => {
+                          const sid = Number(s.id);
+                          const checked = (portfolioStrategyIds || []).map((x) => Number(x)).includes(sid);
+                          return (
+                            <label
+                              key={s.id}
+                              className="flex items-center gap-2 text-sm text-gray-800 cursor-pointer"
+                            >
+                              <Checkbox
+                                checked={checked}
+                                onCheckedChange={(v) => togglePortfolioStrategy(sid, v === true)}
+                                disabled={!canChangeRunContext}
+                                data-testid={`portfolio-strategy-${s.id}`}
+                              />
+                              <span className="text-sm">{s.name}</span>
+                              <span className="text-xs text-gray-400">(ID: {s.id})</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                  <div className="text-xs text-gray-500">
+                    Note: Live paper option quotes require market open + credentials + bypass-hours OFF + replay OFF.
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="flex justify-end pt-2">
+                <Button
+                  onClick={handleSavePortfolioParams}
+                  disabled={saving}
+                  size="sm"
+                  className="rounded-sm btn-active"
+                  data-testid="save-portfolio-btn"
+                >
+                  <Save className="w-3 h-3 mr-1" />
+                  {saving ? "Saving..." : "Save Portfolio"}
+                </Button>
+              </div>
+            </div>
+          </TabsContent>
+
+          {/* Testing Tab */}
+          <TabsContent value="testing" className="space-y-4 mt-6 bg-white p-6 rounded-lg border border-gray-200">
+            <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
               <div className="text-sm font-medium text-gray-900">Bypass Market Hours</div>
 
               <div className="flex items-center justify-between p-3 bg-white rounded-sm border border-gray-200">
@@ -1284,19 +1316,6 @@ const Settings = () => {
                   {saving ? "Saving..." : "Save Replay Settings"}
                 </Button>
               </div>
-            </div>
-
-            <div className="flex justify-end pt-4 border-t border-gray-100">
-              <Button
-                onClick={handleSaveStrategyParams}
-                disabled={saving}
-                size="sm"
-                className="rounded-sm btn-active"
-                data-testid="save-strategy-params-btn"
-              >
-                <Save className="w-3 h-3 mr-1" />
-                {saving ? "Saving..." : "Save Strategy Settings"}
-              </Button>
             </div>
           </TabsContent>
         </Tabs>

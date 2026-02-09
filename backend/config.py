@@ -188,6 +188,14 @@ config = {
     # Strategy definitions are loaded from the saved strategies table using portfolio_strategy_ids.
     "portfolio_enabled": _env_bool("PORTFOLIO_ENABLED", False),
     "portfolio_strategy_ids": [],  # list[int]
+
+    # Per-strategy instance overrides for portfolio mode.
+    # Shape: { "<strategy_id>": {"active": bool, "mode": "paper"|"live", "order_qty": int,
+    #                              "target_points": float, "initial_stoploss": float,
+    #                              "trail_start_profit": float, "trail_step": float,
+    #                              "max_loss_per_trade": float } }
+    # Keys are stored as strings for JSON compatibility.
+    "portfolio_instances": {},
 }
 
 # SQLite Database path

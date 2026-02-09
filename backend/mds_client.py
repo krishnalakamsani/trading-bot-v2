@@ -6,6 +6,8 @@ import httpx
 
 
 _client: httpx.AsyncClient | None = None
+_close_cache: dict[tuple[str, int], tuple[float | None, str | None, float]] = {}
+_candle_cache: dict[tuple[str, int], tuple[dict[str, Any] | None, str | None, float]] = {}
 _last_fetch_ts_close: float = 0.0
 _last_fetch_ts_candle: float = 0.0
 _last_price: float | None = None
@@ -32,17 +34,19 @@ async def fetch_latest_close(
     Returns (close_price, candle_ts_iso).
     Uses a small in-process throttle so callers can invoke it frequently.
     """
-    global _last_fetch_ts_close, _last_price, _last_candle_ts
+    global _close_cache
 
     now = time.time()
     min_poll_seconds = float(min_poll_seconds or 1.0)
     if min_poll_seconds < 0.2:
         min_poll_seconds = 0.2
 
-    if (now - _last_fetch_ts_close) < min_poll_seconds:
-        return _last_price, _last_candle_ts
-
-    _last_fetch_ts_close = now
+    key = (str(symbol or '').strip().upper(), int(timeframe_seconds))
+    cached = _close_cache.get(key)
+    if cached is not None:
+        cached_price, cached_ts, last_fetch = cached
+        if (now - float(last_fetch or 0.0)) < min_poll_seconds:
+            return cached_price, cached_ts
 
     if not base_url:
         return None, None
@@ -73,11 +77,10 @@ async def fetch_latest_close(
     except Exception:
         close_f = None
 
-    if close_f is not None and close_f > 0:
-        _last_price = close_f
-        _last_candle_ts = str(ts) if ts is not None else None
-
-    return _last_price, _last_candle_ts
+    out_price = close_f if (close_f is not None and close_f > 0) else (cached[0] if cached else None)
+    out_ts = (str(ts) if ts is not None else None) if (close_f is not None and close_f > 0) else (cached[1] if cached else None)
+    _close_cache[key] = (out_price, out_ts, now)
+    return out_price, out_ts
 
 
 async def fetch_last_candles(
@@ -214,17 +217,19 @@ async def fetch_latest_candle(
     Returns a dict with keys like: ts/open/high/low/close/volume.
     Uses in-process throttling so callers can invoke frequently.
     """
-    global _last_fetch_ts_candle, _last_candle, _last_candle_ts, _last_price
+    global _candle_cache, _close_cache
 
     now = time.time()
     min_poll_seconds = float(min_poll_seconds or 1.0)
     if min_poll_seconds < 0.2:
         min_poll_seconds = 0.2
 
-    if (now - _last_fetch_ts_candle) < min_poll_seconds:
-        return _last_candle
-
-    _last_fetch_ts_candle = now
+    key = (str(symbol or '').strip().upper(), int(timeframe_seconds))
+    cached = _candle_cache.get(key)
+    if cached is not None:
+        cached_candle, _cached_ts, last_fetch = cached
+        if (now - float(last_fetch or 0.0)) < min_poll_seconds:
+            return cached_candle
 
     candles = await fetch_last_candles(
         base_url=base_url,
@@ -247,10 +252,11 @@ async def fetch_latest_candle(
     except Exception:
         close_f = None
 
-    if close_f is not None and close_f > 0:
-        _last_price = close_f
-        _last_candle_ts = str(ts) if ts is not None else None
-        _last_candle = last
-        return _last_candle
+    # Cache last candle even if close is missing; callers can decide validity.
+    candle_ts = str(ts) if ts is not None else None
+    _candle_cache[key] = (last, candle_ts, now)
 
-    return None
+    if close_f is not None and close_f > 0 and candle_ts:
+        _close_cache[key] = (close_f, candle_ts, now)
+
+    return last

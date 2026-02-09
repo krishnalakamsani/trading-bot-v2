@@ -11,6 +11,22 @@ import AnalyticsMetrics from '../components/AnalyticsMetrics';
 
 const API_URL = process.env.REACT_APP_BACKEND_URL || '';
 
+const isTimeOnly = (value) => {
+  if (typeof value !== 'string') return false;
+  return /^\d{2}:\d{2}:\d{2}$/.test(value.trim());
+};
+
+const tradeTimestamp = (trade) => {
+  const raw = trade?.entry_time;
+  const candidate = isTimeOnly(raw)
+    ? (trade?.created_at || trade?.exit_time)
+    : (raw || trade?.created_at || trade?.exit_time);
+  if (!candidate) return null;
+  const d = new Date(candidate);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+};
+
 const TradesAnalysis = () => {
   const [analytics, setAnalytics] = useState(null);
   const [trades, setTrades] = useState([]);
@@ -106,7 +122,8 @@ const TradesAnalysis = () => {
     // Group by day
     const byDay = {};
     trades.forEach(trade => {
-      const day = new Date(trade.entry_time).toLocaleDateString('en-IN');
+      const d = tradeTimestamp(trade);
+      const day = d ? d.toLocaleDateString('en-IN') : 'Unknown';
       if (!byDay[day]) {
         byDay[day] = { count: 0, pnl: 0, wins: 0 };
       }
@@ -142,12 +159,18 @@ const TradesAnalysis = () => {
     // Filter by date range
     if (filters.startDate) {
       const startDate = new Date(filters.startDate);
-      filtered = filtered.filter(t => new Date(t.entry_time) >= startDate);
+      filtered = filtered.filter(t => {
+        const d = tradeTimestamp(t);
+        return !!d && d >= startDate;
+      });
     }
     if (filters.endDate) {
       const endDate = new Date(filters.endDate);
       endDate.setHours(23, 59, 59, 999);
-      filtered = filtered.filter(t => new Date(t.entry_time) <= endDate);
+      filtered = filtered.filter(t => {
+        const d = tradeTimestamp(t);
+        return !!d && d <= endDate;
+      });
     }
 
     // Filter by option type

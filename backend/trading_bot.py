@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 import logging
 import random
 import time
+import math
 
 from config import bot_state, config, DB_PATH
 from indices import get_index_config, round_to_strike
@@ -44,6 +45,9 @@ class TradingBot:
         self._portfolio_strategies = []
         self._portfolio_loaded_for_ids = None
         self._portfolio_live_sec_cache = {}
+        self._portfolio_index_ltp_by_index = {}
+        self._portfolio_other_candle_state_by_key = {}
+        self._portfolio_sim_base_price_by_index = {}
         self.last_exit_candle_time = None
         self.last_trade_time = None  # For min_trade_gap protection
         self.last_signal = None  # For trade_only_on_flip protection
@@ -54,11 +58,55 @@ class TradingBot:
         self._paper_replay_pos = 0
         self._paper_replay_htf_elapsed = 0
         self._last_mds_candle_ts = None
+        self._portfolio_last_mds_candle_ts_by_key = {}
         self._mds_htf_count = 0
         self._mds_htf_high = 0.0
         self._mds_htf_low = float('inf')
         self._mds_htf_close = 0.0
         self._initialize_indicator()
+
+    def _get_simulated_option_price(self, index_ltp: float, strike: int, option_type: str, index_name: str | None = None) -> float:
+        """Synthetic option pricing for paper-mode fallback.
+
+        This is intentionally simple: intrinsic value + a time-value component that
+        decreases as the strike moves away from ATM. Used only when live option
+        quotes are unavailable or disabled.
+        """
+        try:
+            index_ltp = float(index_ltp or 0.0)
+        except Exception:
+            index_ltp = 0.0
+
+        try:
+            strike = int(strike or 0)
+        except Exception:
+            strike = 0
+
+        option_type = str(option_type or "").upper().strip()
+        if option_type not in {"CE", "PE"}:
+            option_type = "CE"
+
+        idx_name = str(index_name or config.get("selected_index") or "NIFTY").strip().upper()
+        idx_cfg = get_index_config(idx_name)
+        strike_interval = int(idx_cfg.get("strike_interval", 50) or 50)
+        if strike <= 0:
+            strike = int(round_to_strike(index_ltp, idx_name))
+
+        intrinsic = 0.0
+        if option_type == "CE":
+            intrinsic = max(0.0, index_ltp - float(strike))
+        else:
+            intrinsic = max(0.0, float(strike) - index_ltp)
+
+        # Time value: higher near ATM, exponentially decays with distance.
+        dist = abs(index_ltp - float(strike))
+        base_tv = max(8.0, index_ltp * 0.0015)  # e.g. ~35 for NIFTY@23500
+        decay = math.exp(-dist / max(1.0, float(strike_interval) * 2.0))
+        time_value = base_tv * decay
+
+        premium = max(2.0, intrinsic + time_value)
+        premium = round(premium / 0.05) * 0.05
+        return float(round(premium, 2))
 
     async def _portfolio_get_position_ltp(self, position: PortfolioPosition, index_ltp: float) -> float:
         """Get option LTP for a portfolio position.
@@ -72,12 +120,19 @@ class TradingBot:
             option_type = str(position.option_type or '').upper()
             expiry = str(position.expiry or '')
         except Exception:
-            return float(self._get_simulated_option_price(float(index_ltp or 0.0), 0, 'CE'))
+            return float(self._get_simulated_option_price(float(index_ltp or 0.0), 0, 'CE', index_name=None))
 
         if strike <= 0 or option_type not in {'CE', 'PE'}:
-            return float(self._get_simulated_option_price(float(index_ltp or 0.0), strike, option_type))
+            return float(self._get_simulated_option_price(float(index_ltp or 0.0), strike, option_type, index_name=index_name))
 
-        if self._paper_should_use_live_option_quotes():
+        use_live_quotes = False
+        try:
+            use_live_quotes = str(getattr(position, 'mode', 'paper') or 'paper').strip().lower() == 'live'
+        except Exception:
+            use_live_quotes = False
+        use_live_quotes = bool(use_live_quotes or self._paper_should_use_live_option_quotes())
+
+        if use_live_quotes:
             if not self.dhan:
                 try:
                     self.initialize_dhan()
@@ -116,14 +171,14 @@ class TradingBot:
                         pass
 
         # Fallback: synthetic pricing
-        return float(self._get_simulated_option_price(float(index_ltp or 0.0), int(strike), str(option_type)))
+        return float(self._get_simulated_option_price(float(index_ltp or 0.0), int(strike), str(option_type), index_name=index_name))
 
     async def _portfolio_update_trailing_sl(self, position: PortfolioPosition, current_ltp: float) -> None:
         if not position:
             return
 
-        trail_start = float(config.get('trail_start_profit', 0) or 0)
-        trail_step = float(config.get('trail_step', 0) or 0)
+        trail_start = float(getattr(position, 'trail_start_profit', 0) or 0)
+        trail_step = float(getattr(position, 'trail_step', 0) or 0)
         if trail_start == 0 or trail_step == 0:
             return
 
@@ -131,7 +186,7 @@ class TradingBot:
         if profit_points > float(position.highest_profit or 0.0):
             position.highest_profit = float(profit_points)
 
-        initial_sl = float(config.get('initial_stoploss', 0) or 0)
+        initial_sl = float(getattr(position, 'initial_stoploss', 0) or 0)
         if initial_sl > 0 and position.trailing_sl is None:
             position.trailing_sl = float(position.entry_price) - float(initial_sl)
             return
@@ -151,10 +206,7 @@ class TradingBot:
         if not position:
             return False
 
-        qty = int(position.qty or 0)
-        if qty <= 0:
-            index_config = get_index_config(config['selected_index'])
-            qty = int(config.get('order_qty', 0) or 0) * int(index_config.get('lot_size', 1) or 1)
+        qty = int(getattr(position, 'qty', 0) or 0)
         if qty <= 0:
             return False
 
@@ -168,12 +220,12 @@ class TradingBot:
             bot_state['daily_max_loss_triggered'] = True
             return True
 
-        max_loss_per_trade = float(config.get('max_loss_per_trade', 0) or 0)
+        max_loss_per_trade = float(getattr(position, 'max_loss_per_trade', 0) or 0)
         if max_loss_per_trade > 0 and pnl < -max_loss_per_trade:
             await self._portfolio_close_position(strategy, float(current_ltp), 'Max Loss Per Trade')
             return True
 
-        target_points = float(config.get('target_points', 0) or 0)
+        target_points = float(getattr(position, 'target_points', 0) or 0)
         if target_points > 0 and profit_points >= target_points:
             await self._portfolio_close_position(strategy, float(current_ltp), 'Target Hit')
             return True
@@ -368,10 +420,26 @@ class TradingBot:
 
         if self._portfolio_enabled():
             await self._portfolio_load_strategies()
+            candle_index = str(index_name or '').strip().upper()
             for strat in self._portfolio_strategies:
-                await strat.on_candle_close(high=float(high), low=float(low), close=float(close), bot=self)
+                try:
+                    if str(strat.index_name() or '').strip().upper() != candle_index:
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if int(getattr(strat, 'candle_interval')() or 0) != int(candle_interval or 0):
+                        continue
+                except Exception:
+                    # If strategy doesn't expose candle_interval(), fall back to global interval behavior.
+                    pass
+                await strat.on_candle_close(index_name=candle_index, candle_interval=int(candle_interval or 0), high=float(high), low=float(low), close=float(close), bot=self)
 
             bot_state['portfolio_positions'] = self._portfolio_state_positions()
+            try:
+                bot_state['portfolio_strategies_state'] = [s.to_state() for s in self._portfolio_strategies]
+            except Exception:
+                bot_state['portfolio_strategies_state'] = []
             # Backward compatibility: expose first position as current_position
             first = None
             for strat in self._portfolio_strategies:
@@ -756,34 +824,50 @@ class TradingBot:
     async def _portfolio_load_strategies(self) -> None:
         ids = config.get('portfolio_strategy_ids') or []
         normalized = tuple(int(x) for x in ids if str(x).isdigit())
-        if self._portfolio_loaded_for_ids == normalized:
-            return
-        self._portfolio_loaded_for_ids = normalized
+        instances = config.get('portfolio_instances') or {}
 
-        self._portfolio_strategies = []
-        if not normalized:
-            return
+        # Reload full strategy list only when IDs change.
+        if self._portfolio_loaded_for_ids != normalized:
+            self._portfolio_loaded_for_ids = normalized
+            self._portfolio_strategies = []
+            if not normalized:
+                return
 
-        if bot_state.get('mode') != 'paper':
-            logger.warning('[PORTFOLIO] Portfolio mode currently supported in paper mode only')
-            return
+            for strategy_id in normalized:
+                try:
+                    s = await get_strategy(int(strategy_id))
+                except Exception:
+                    s = None
+                if not s:
+                    continue
 
-        for strategy_id in normalized:
-            try:
-                s = await get_strategy(int(strategy_id))
-            except Exception:
-                s = None
-            if not s:
-                continue
-            self._portfolio_strategies.append(
-                PortfolioStrategy(
-                    strategy_id=str(s.get('id')),
-                    strategy_name=str(s.get('name') or f'Strategy {strategy_id}'),
-                    strategy_config=(s.get('config') or {}),
+                sid = str(s.get('id'))
+                inst = {}
+                try:
+                    inst = instances.get(sid) or instances.get(str(strategy_id)) or {}
+                except Exception:
+                    inst = {}
+
+                self._portfolio_strategies.append(
+                    PortfolioStrategy(
+                        strategy_id=str(s.get('id')),
+                        strategy_name=str(s.get('name') or f'Strategy {strategy_id}'),
+                        strategy_config=(s.get('config') or {}),
+                        instance_config=(inst or {}),
+                    )
                 )
-            )
 
-        logger.info('[PORTFOLIO] Loaded strategies: %s', [p.strategy_name for p in self._portfolio_strategies])
+            logger.info('[PORTFOLIO] Loaded strategies: %s', [p.strategy_name for p in self._portfolio_strategies])
+
+        # Always refresh instance overrides (so UI changes take effect without reloading strategies).
+        for strat in self._portfolio_strategies:
+            try:
+                strat.instance = dict(instances.get(str(strat.strategy_id)) or instances.get(int(strat.strategy_id)) or {})
+            except Exception:
+                try:
+                    strat.instance = dict(instances.get(str(strat.strategy_id)) or {})
+                except Exception:
+                    strat.instance = {}
 
     def _portfolio_state_positions(self) -> list:
         positions = []
@@ -801,6 +885,7 @@ class TradingBot:
                 'expiry': p.expiry,
                 'security_id': p.security_id,
                 'qty': p.qty,
+                'mode': getattr(p, 'mode', 'paper'),
                 'entry_time': p.entry_time,
                 'entry_price': p.entry_price,
                 'current_ltp': p.current_ltp,
@@ -810,51 +895,172 @@ class TradingBot:
         return positions
 
     async def _portfolio_enter_position(self, strategy: PortfolioStrategy, option_type: str, strike: int, index_close: float) -> None:
-        if bot_state.get('mode') != 'paper':
-            return
-
-        index_name = str(config.get('selected_index', 'NIFTY') or 'NIFTY')
+        try:
+            index_name = str(strategy.index_name() or config.get('selected_index', 'NIFTY') or 'NIFTY')
+        except Exception:
+            index_name = str(config.get('selected_index', 'NIFTY') or 'NIFTY')
+        index_name = str(index_name or 'NIFTY').strip().upper()
         index_config = get_index_config(index_name)
-        expiry = str(index_config.get('expiry') or '')
+        expiry = ''
 
-        qty = int(strategy.cfg.get('order_qty', 0) or 0)
-        if qty <= 0:
-            qty = int(config.get('order_qty', 0) or 0) * int(index_config.get('lot_size', 1) or 1)
+        # Prefer Dhan's expiry list when possible.
+        try:
+            if self.dhan is None:
+                self.initialize_dhan()
+        except Exception:
+            pass
+
+        try:
+            expiry = await self.dhan.get_nearest_expiry(index_name) if self.dhan else ''
+        except Exception:
+            expiry = ''
+
+        if not expiry:
+            try:
+                ist = get_ist_time()
+                expiry_day = int(index_config.get('expiry_day', 1) or 1)
+                days_until_expiry = (expiry_day - ist.weekday()) % 7
+                if days_until_expiry == 0 and ist.hour >= 15:
+                    days_until_expiry = 7
+                expiry_date = ist + timedelta(days=days_until_expiry)
+                expiry = expiry_date.strftime('%Y-%m-%d')
+            except Exception:
+                expiry = ''
+
+        mode = 'paper'
+        try:
+            mode = str(strategy.instance_mode()).strip().lower()
+        except Exception:
+            mode = 'paper'
+        if mode not in {'paper', 'live'}:
+            mode = 'paper'
+
+        lot_size = int(index_config.get('lot_size', 1) or 1)
+        lots = 0
+        try:
+            lots = int(strategy.effective('order_qty', 0) or 0)
+        except Exception:
+            lots = 0
+        if lots <= 0:
+            lots = int(config.get('order_qty', 0) or 0)
+        lots = max(1, min(10, int(lots)))
+        qty = int(lots) * int(lot_size)
         if qty <= 0:
             return
 
-        entry_price = float(self._get_simulated_option_price(float(index_close), int(strike), str(option_type)))
+        # Per-position risk params (snapshot at entry).
+        try:
+            target_points = float(strategy.effective('target_points', 0) or 0)
+        except Exception:
+            target_points = 0.0
+        try:
+            initial_stoploss = float(strategy.effective('initial_stoploss', 0) or 0)
+        except Exception:
+            initial_stoploss = 0.0
+        try:
+            trail_start_profit = float(strategy.effective('trail_start_profit', 0) or 0)
+        except Exception:
+            trail_start_profit = 0.0
+        try:
+            trail_step = float(strategy.effective('trail_step', 0) or 0)
+        except Exception:
+            trail_step = 0.0
+        try:
+            max_loss_per_trade = float(strategy.effective('max_loss_per_trade', 0) or 0)
+        except Exception:
+            max_loss_per_trade = 0.0
+
+        entry_price = 0.0
         security_id = f"SIM_{index_name}_{expiry}_{int(strike)}_{str(option_type).upper()}"
-
-        # During market hours, try to use live option quotes even in paper mode.
-        if self._paper_should_use_live_option_quotes():
-            if not self.dhan:
-                try:
-                    self.initialize_dhan()
-                except Exception:
-                    pass
-            if self.dhan:
-                try:
-                    live_security_id = await self.dhan.get_atm_option_security_id(index_name, int(strike), str(option_type).upper(), expiry)
-                    if live_security_id:
-                        ltp = await self.dhan.get_option_ltp(
-                            security_id=str(live_security_id),
-                            strike=int(strike),
-                            option_type=str(option_type).upper(),
-                            expiry=str(expiry),
-                            index_name=str(index_name),
-                        )
-                        if ltp and float(ltp) > 0:
-                            ltp = round(float(ltp) / 0.05) * 0.05
-                            entry_price = float(round(float(ltp), 2))
-                            security_id = str(live_security_id)
-                except Exception:
-                    pass
-
         trade_id = f"SIM_{int(time.time())}_{random.randint(1000, 9999)}"
-        entry_time = get_ist_time().strftime('%H:%M:%S')
+
+        if mode == 'live':
+            if not self.dhan:
+                if not self.initialize_dhan():
+                    logger.error('[PORTFOLIO] LIVE entry requested but Dhan API not available')
+                    return
+
+            try:
+                live_security_id = await self.dhan.get_atm_option_security_id(index_name, int(strike), str(option_type).upper(), expiry)
+            except Exception:
+                live_security_id = ''
+            if not live_security_id:
+                logger.error('[PORTFOLIO] LIVE entry failed: unable to resolve option security_id')
+                return
+
+            security_id = str(live_security_id)
+            order = await self.dhan.place_order(
+                security_id=str(security_id),
+                transaction_type='BUY',
+                qty=int(qty),
+                index_name=str(index_name),
+            )
+            if not order or order.get('status') != 'success' or not order.get('orderId'):
+                logger.error('[PORTFOLIO] LIVE BUY order failed: %s', order)
+                return
+
+            trade_id = str(order.get('orderId'))
+            filled = await self.dhan.verify_order_filled(
+                order_id=str(trade_id),
+                security_id=str(security_id),
+                expected_qty=int(qty),
+                timeout_seconds=30,
+            )
+            if not filled.get('filled'):
+                logger.error('[PORTFOLIO] LIVE BUY not filled: %s', filled)
+                return
+
+            try:
+                entry_price = float(filled.get('average_price') or 0.0)
+            except Exception:
+                entry_price = 0.0
+            if entry_price <= 0:
+                try:
+                    ltp = await self.dhan.get_option_ltp(
+                        security_id=str(security_id),
+                        strike=int(strike),
+                        option_type=str(option_type).upper(),
+                        expiry=str(expiry),
+                        index_name=str(index_name),
+                    )
+                    if ltp and float(ltp) > 0:
+                        entry_price = float(round(round(float(ltp) / 0.05) * 0.05, 2))
+                except Exception:
+                    pass
+            if entry_price <= 0:
+                logger.error('[PORTFOLIO] LIVE entry price missing; aborting position open')
+                return
+
+        else:
+            entry_price = float(self._get_simulated_option_price(float(index_close), int(strike), str(option_type)))
+
+            # During market hours, try to use live option quotes even in paper mode.
+            if self._paper_should_use_live_option_quotes():
+                if not self.dhan:
+                    try:
+                        self.initialize_dhan()
+                    except Exception:
+                        pass
+                if self.dhan:
+                    try:
+                        live_security_id = await self.dhan.get_atm_option_security_id(index_name, int(strike), str(option_type).upper(), expiry)
+                        if live_security_id:
+                            ltp = await self.dhan.get_option_ltp(
+                                security_id=str(live_security_id),
+                                strike=int(strike),
+                                option_type=str(option_type).upper(),
+                                expiry=str(expiry),
+                                index_name=str(index_name),
+                            )
+                            if ltp and float(ltp) > 0:
+                                ltp = round(float(ltp) / 0.05) * 0.05
+                                entry_price = float(round(float(ltp), 2))
+                                security_id = str(live_security_id)
+                    except Exception:
+                        pass
 
         now_utc = datetime.now(timezone.utc)
+        entry_time = now_utc.isoformat()
         self.last_order_time_utc = now_utc
         strategy.position = PortfolioPosition(
             strategy_id=strategy.strategy_id,
@@ -866,9 +1072,15 @@ class TradingBot:
             expiry=str(expiry),
             security_id=str(security_id),
             qty=int(qty),
+            mode=str(mode),
             entry_time=str(entry_time),
             entry_price=float(entry_price),
             current_ltp=float(entry_price),
+            target_points=float(target_points or 0.0),
+            initial_stoploss=float(initial_stoploss or 0.0),
+            trail_start_profit=float(trail_start_profit or 0.0),
+            trail_step=float(trail_step or 0.0),
+            max_loss_per_trade=float(max_loss_per_trade or 0.0),
             trailing_sl=None,
             highest_profit=0.0,
             entry_time_utc=now_utc,
@@ -883,21 +1095,68 @@ class TradingBot:
             'expiry': str(expiry),
             'entry_price': float(entry_price),
             'qty': int(qty),
-            'mode': str(bot_state.get('mode', 'paper')),
+            'mode': str(mode),
             'index_name': str(index_name),
             'strategy_id': str(strategy.strategy_id),
             'created_at': datetime.now(timezone.utc).isoformat(),
         })
 
-        logger.info('[PORTFOLIO] ENTER %s [%s] %s %s %s @ %.2f', strategy.strategy_name, strategy.strategy_id, index_name, option_type, strike, entry_price)
+        try:
+            strategy.last_action = 'ENTER'
+            strategy.last_action_time_utc = datetime.now(timezone.utc).isoformat()
+            strategy.last_action_reason = None
+        except Exception:
+            pass
+
+        logger.info('[PORTFOLIO][STRAT:%s] ENTER %s mode=%s %s %s %s @ %.2f', strategy.strategy_id, strategy.strategy_name, mode, index_name, option_type, strike, entry_price)
 
     async def _portfolio_close_position(self, strategy: PortfolioStrategy, exit_price: float, reason: str) -> None:
         if not strategy.position:
             return
         p = strategy.position
 
+        mode = str(getattr(p, 'mode', 'paper') or 'paper').strip().lower()
+        if mode not in {'paper', 'live'}:
+            mode = 'paper'
+
         self.last_order_time_utc = datetime.now(timezone.utc)
-        exit_time = get_ist_time().strftime('%H:%M:%S')
+        exit_time = datetime.now(timezone.utc).isoformat()
+
+        # LIVE exit: place real SELL order and use average fill price.
+        if mode == 'live':
+            if not self.dhan:
+                if not self.initialize_dhan():
+                    logger.error('[PORTFOLIO] LIVE exit requested but Dhan API not available')
+                    return
+
+            order = await self.dhan.place_order(
+                security_id=str(p.security_id),
+                transaction_type='SELL',
+                qty=int(p.qty),
+                index_name=str(p.index_name),
+            )
+            if not order or order.get('status') != 'success' or not order.get('orderId'):
+                logger.error('[PORTFOLIO] LIVE SELL order failed: %s', order)
+                return
+
+            sell_id = str(order.get('orderId'))
+            filled = await self.dhan.verify_order_filled(
+                order_id=str(sell_id),
+                security_id=str(p.security_id),
+                expected_qty=int(p.qty),
+                timeout_seconds=30,
+            )
+            if not filled.get('filled'):
+                logger.error('[PORTFOLIO] LIVE SELL not filled: %s', filled)
+                return
+
+            try:
+                filled_px = float(filled.get('average_price') or 0.0)
+            except Exception:
+                filled_px = 0.0
+            if filled_px > 0:
+                exit_price = float(filled_px)
+
         pnl = (float(exit_price) - float(p.entry_price)) * int(p.qty)
 
         bot_state['daily_pnl'] = float(bot_state.get('daily_pnl', 0.0) or 0.0) + float(pnl)
@@ -910,7 +1169,14 @@ class TradingBot:
             exit_reason=str(reason),
         )
 
-        logger.info('[PORTFOLIO] EXIT %s [%s] %s %s %s @ %.2f pnl=%.2f reason=%s', strategy.strategy_name, strategy.strategy_id, p.index_name, p.option_type, p.strike, exit_price, pnl, reason)
+        try:
+            strategy.last_action = 'EXIT'
+            strategy.last_action_time_utc = datetime.now(timezone.utc).isoformat()
+            strategy.last_action_reason = str(reason)
+        except Exception:
+            pass
+
+        logger.info('[PORTFOLIO][STRAT:%s] EXIT %s mode=%s %s %s %s @ %.2f pnl=%.2f reason=%s', strategy.strategy_id, strategy.strategy_name, mode, p.index_name, p.option_type, p.strike, exit_price, pnl, reason)
         strategy.position = None
 
     async def _portfolio_squareoff_all(self, reason: str = 'Force Square-off') -> None:
@@ -918,6 +1184,44 @@ class TradingBot:
             if strat.position:
                 exit_price = float(strat.position.current_ltp)
                 await self._portfolio_close_position(strat, exit_price, reason)
+
+    async def _portfolio_squareoff_strategy(self, strategy_id: str | int, reason: str = 'Manual Square-off') -> dict:
+        """Square off only one portfolio strategy's open position."""
+        if not self._portfolio_enabled():
+            return {"status": "error", "message": "Portfolio mode not enabled"}
+
+        try:
+            sid = str(int(strategy_id))
+        except Exception:
+            sid = str(strategy_id)
+
+        await self._portfolio_load_strategies()
+        target = None
+        for s in list(self._portfolio_strategies):
+            if str(s.strategy_id) == sid:
+                target = s
+                break
+
+        if not target or not target.position:
+            return {"status": "error", "message": "No open position for this strategy"}
+
+        try:
+            index_ltp = float(bot_state.get('index_ltp', 0.0) or 0.0)
+        except Exception:
+            index_ltp = 0.0
+
+        try:
+            ltp = await self._portfolio_get_position_ltp(target.position, index_ltp)
+        except Exception:
+            ltp = float(getattr(target.position, 'current_ltp', 0.0) or 0.0)
+
+        if ltp and float(ltp) > 0:
+            target.position.current_ltp = float(ltp)
+
+        await self._portfolio_close_position(target, float(target.position.current_ltp), reason)
+        bot_state['portfolio_positions'] = self._portfolio_state_positions()
+        bot_state['current_position'] = None
+        return {"status": "success", "message": f"Strategy {sid} squared off"}
     
     def reset_indicator(self):
         """Reset the selected indicator"""
@@ -1050,9 +1354,28 @@ class TradingBot:
         """Start the trading bot"""
         if self.running:
             return {"status": "error", "message": "Bot already running"}
-        
-        # Only require Dhan in live mode. Paper mode can run without broker SDK.
-        if bot_state.get('mode') != 'paper':
+
+        # Require Dhan when running in global LIVE mode, OR when any active portfolio instance is LIVE.
+        needs_dhan = bot_state.get('mode') != 'paper'
+        if (not needs_dhan) and self._portfolio_enabled():
+            try:
+                instances = config.get('portfolio_instances') or {}
+                for sid in (config.get('portfolio_strategy_ids') or []):
+                    key = str(int(sid)) if str(sid).isdigit() else str(sid)
+                    inst = instances.get(key) or {}
+                    if not isinstance(inst, dict):
+                        continue
+                    active = inst.get('active')
+                    if active is None:
+                        active = True
+                    mode = str(inst.get('mode') or 'paper').strip().lower()
+                    if bool(active) and mode == 'live':
+                        needs_dhan = True
+                        break
+            except Exception:
+                pass
+
+        if needs_dhan:
             if not self.initialize_dhan():
                 return {"status": "error", "message": "Dhan API not available (credentials/SDK)"}
 
@@ -1501,6 +1824,80 @@ class TradingBot:
                                 if mds_new_candle_ts and mds_new_candle_ts != self._last_mds_candle_ts:
                                     mds_new_candle = candle
                                     self._last_mds_candle_ts = mds_new_candle_ts
+
+                        # Portfolio mode: also process other indices (per-strategy selected_index)
+                        if self._portfolio_enabled():
+                            await self._portfolio_load_strategies()
+                            needed_pairs = set()
+                            for strat in self._portfolio_strategies:
+                                try:
+                                    if not strat.is_active() and not strat.position:
+                                        continue
+                                except Exception:
+                                    pass
+                                try:
+                                    sym = str(strat.index_name() or '').strip().upper() or 'NIFTY'
+                                    tf = int(getattr(strat, 'candle_interval')() or int(config.get('candle_interval', candle_interval) or candle_interval))
+                                    needed_pairs.add((sym, int(tf)))
+                                except Exception:
+                                    pass
+
+                            primary_sym = str(index_name or '').strip().upper()
+                            primary_tf = int(config.get('candle_interval', candle_interval) or candle_interval)
+                            # Remove the primary poll pair; it's already handled above.
+                            try:
+                                needed_pairs.discard((primary_sym, int(primary_tf)))
+                            except Exception:
+                                pass
+
+                            # Poll each required (symbol, timeframe) and route candle closes.
+                            for sym, tf in sorted(needed_pairs):
+                                if not sym or int(tf) <= 0:
+                                    continue
+                                try:
+                                    other_candle = await fetch_latest_candle(
+                                        base_url=base_url,
+                                        symbol=str(sym),
+                                        timeframe_seconds=int(tf),
+                                        min_poll_seconds=poll_s,
+                                    )
+                                except Exception:
+                                    other_candle = None
+
+                                if not isinstance(other_candle, dict):
+                                    continue
+
+                                other_ts = str(other_candle.get('ts') or '') or None
+                                if not other_ts:
+                                    continue
+
+                                key = (str(sym), int(tf))
+                                if self._portfolio_last_mds_candle_ts_by_key.get(key) == other_ts:
+                                    continue
+                                self._portfolio_last_mds_candle_ts_by_key[key] = other_ts
+
+                                try:
+                                    oh = float(other_candle.get('high') or 0.0)
+                                    ol = float(other_candle.get('low') or float('inf'))
+                                    oc = float(other_candle.get('close') or 0.0)
+                                except Exception:
+                                    oh, ol, oc = 0.0, float('inf'), 0.0
+
+                                if oh > 0 and ol < float('inf') and oc > 0:
+                                    try:
+                                        if isinstance(getattr(self, '_portfolio_index_ltp_by_index', None), dict):
+                                            self._portfolio_index_ltp_by_index[str(sym)] = float(oc)
+                                    except Exception:
+                                        pass
+                                    await self._handle_closed_candle(
+                                        index_name=str(sym),
+                                        candle_number=0,
+                                        candle_interval=int(tf),
+                                        high=oh,
+                                        low=ol,
+                                        close=oc,
+                                        current_candle_time=datetime.now(),
+                                    )
                         elif self.dhan:
                             # If MDS has no candles yet, fall back to direct quote.
                             try:
@@ -1682,6 +2079,153 @@ class TradingBot:
 
                         htf_candle_start_time = datetime.now()
                         htf_high, htf_low, htf_close = 0, float('inf'), 0
+
+                # Portfolio mode: drive additional indices (besides global selected_index) using LTP-based candles.
+                if provider != 'mds' and self._portfolio_enabled():
+                    await self._portfolio_load_strategies()
+                    needed_tfs_by_index = {}
+                    for strat in self._portfolio_strategies:
+                        try:
+                            if not strat.is_active() and not strat.position:
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            sym = str(strat.index_name() or '').strip().upper() or 'NIFTY'
+                            tf = int(getattr(strat, 'candle_interval')() or int(config.get('candle_interval', candle_interval) or candle_interval))
+                            needed_tfs_by_index.setdefault(sym, set()).add(int(tf))
+                        except Exception:
+                            pass
+
+                    primary = str(index_name or '').strip().upper()
+                    try:
+                        self._portfolio_index_ltp_by_index[primary] = float(bot_state.get('index_ltp', 0.0) or 0.0)
+                    except Exception:
+                        pass
+
+                    # Update primary index candles for any additional timeframes besides the global one.
+                    try:
+                        primary_ltp = float(bot_state.get('index_ltp', 0.0) or 0.0)
+                    except Exception:
+                        primary_ltp = 0.0
+
+                    global_tf = int(config.get('candle_interval', candle_interval) or candle_interval)
+                    for tf in sorted(needed_tfs_by_index.get(primary, set()) or []):
+                        if int(tf) <= 0 or int(tf) == int(global_tf):
+                            continue
+                        if primary_ltp <= 0:
+                            continue
+
+                        key = (primary, int(tf))
+                        st = self._portfolio_other_candle_state_by_key.get(key)
+                        if not isinstance(st, dict):
+                            st = {
+                                'start': datetime.now(),
+                                'high': 0.0,
+                                'low': float('inf'),
+                                'close': 0.0,
+                                'num': 0,
+                            }
+
+                        if float(primary_ltp) > float(st.get('high') or 0.0):
+                            st['high'] = float(primary_ltp)
+                        if float(primary_ltp) < float(st.get('low') or float('inf')):
+                            st['low'] = float(primary_ltp)
+                        st['close'] = float(primary_ltp)
+
+                        elapsed = (datetime.now() - st.get('start', datetime.now())).total_seconds()
+                        if elapsed >= float(tf):
+                            st['num'] = int(st.get('num') or 0) + 1
+                            await self._handle_closed_candle(
+                                index_name=primary,
+                                candle_number=int(st['num']),
+                                candle_interval=int(tf),
+                                high=float(st.get('high') or 0.0),
+                                low=float(st.get('low') or float('inf')),
+                                close=float(st.get('close') or 0.0),
+                                current_candle_time=datetime.now(),
+                            )
+                            st['start'] = datetime.now()
+                            st['high'] = 0.0
+                            st['low'] = float('inf')
+                            st['close'] = 0.0
+
+                        self._portfolio_other_candle_state_by_key[key] = st
+
+                    for other in sorted(i for i in needed_tfs_by_index.keys() if i and i != primary):
+                        other_ltp = 0.0
+
+                        # Synthetic after-hours movement per-index when bypass_market_hours is enabled.
+                        if bot_state.get('mode') == 'paper' and bool(config.get('bypass_market_hours', False)):
+                            base = self._portfolio_sim_base_price_by_index.get(other)
+                            if base is None:
+                                if other == 'NIFTY':
+                                    base = 23500.0
+                                elif other == 'BANKNIFTY':
+                                    base = 51500.0
+                                elif other == 'FINNIFTY':
+                                    base = 22000.0
+                                elif other == 'MIDCPNIFTY':
+                                    base = 12500.0
+                                else:
+                                    base = 70000.0
+                            base = float(base) + float(random.choice([-15, -10, -5, -2, 0, 2, 5, 10, 15]))
+                            self._portfolio_sim_base_price_by_index[other] = base
+                            other_ltp = float(round(base, 2))
+                        elif self.dhan:
+                            try:
+                                other_ltp = float(await asyncio.to_thread(self.dhan.get_index_ltp, other))
+                            except Exception:
+                                other_ltp = 0.0
+
+                        if other_ltp <= 0:
+                            continue
+
+                        try:
+                            self._portfolio_index_ltp_by_index[other] = float(other_ltp)
+                        except Exception:
+                            pass
+
+                        for tf in sorted(needed_tfs_by_index.get(other, set()) or []):
+                            if int(tf) <= 0:
+                                continue
+
+                            key = (other, int(tf))
+                            st = self._portfolio_other_candle_state_by_key.get(key)
+                            if not isinstance(st, dict):
+                                st = {
+                                    'start': datetime.now(),
+                                    'high': 0.0,
+                                    'low': float('inf'),
+                                    'close': 0.0,
+                                    'num': 0,
+                                }
+
+                            if float(other_ltp) > float(st.get('high') or 0.0):
+                                st['high'] = float(other_ltp)
+                            if float(other_ltp) < float(st.get('low') or float('inf')):
+                                st['low'] = float(other_ltp)
+                            st['close'] = float(other_ltp)
+
+                            elapsed_other = (datetime.now() - st.get('start', datetime.now())).total_seconds()
+                            if elapsed_other >= float(tf):
+                                st['num'] = int(st.get('num') or 0) + 1
+                                await self._handle_closed_candle(
+                                    index_name=other,
+                                    candle_number=int(st['num']),
+                                    candle_interval=int(tf),
+                                    high=float(st.get('high') or 0.0),
+                                    low=float(st.get('low') or float('inf')),
+                                    close=float(st.get('close') or 0.0),
+                                    current_candle_time=datetime.now(),
+                                )
+
+                                st['start'] = datetime.now()
+                                st['high'] = 0.0
+                                st['low'] = float('inf')
+                                st['close'] = 0.0
+
+                            self._portfolio_other_candle_state_by_key[key] = st
                 
                 # Check SL/Target on EVERY TICK (responsive protection)
                 if self._portfolio_enabled():
@@ -1690,9 +2234,25 @@ class TradingBot:
                         if not strat.position:
                             continue
 
+                        idx_for_pos = None
+                        try:
+                            idx_for_pos = str(strat.position.index_name or '').strip().upper()
+                        except Exception:
+                            idx_for_pos = None
+
+                        # If we have a fresher LTP for the position's own index (from MDS multi-index polling), use it.
+                        idx_ltp = float(bot_state.get('index_ltp', 0.0) or 0.0)
+                        try:
+                            if idx_for_pos and isinstance(getattr(self, '_portfolio_index_ltp_by_index', None), dict):
+                                v = self._portfolio_index_ltp_by_index.get(idx_for_pos)
+                                if v is not None and float(v) > 0:
+                                    idx_ltp = float(v)
+                        except Exception:
+                            pass
+
                         try:
                             strat.position.current_ltp = float(
-                                await self._portfolio_get_position_ltp(strat.position, float(bot_state.get('index_ltp', 0.0) or 0.0))
+                                await self._portfolio_get_position_ltp(strat.position, float(idx_ltp))
                             )
                         except Exception:
                             pass
@@ -1813,6 +2373,7 @@ class TradingBot:
                 "htf_supertrend_value": bot_state.get('htf_supertrend_value', 0.0),
                 "position": bot_state['current_position'],
                 "portfolio_positions": bot_state.get('portfolio_positions', []),
+                "portfolio_strategies_state": bot_state.get('portfolio_strategies_state', []),
                 "entry_price": bot_state['entry_price'],
                 "current_option_ltp": bot_state['current_option_ltp'],
                 "trailing_sl": bot_state['trailing_sl'],

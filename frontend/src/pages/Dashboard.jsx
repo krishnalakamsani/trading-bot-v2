@@ -5,6 +5,7 @@ import TopBar from "@/components/TopBar";
 import PositionPanel from "@/components/PositionPanel";
 import ControlsPanel from "@/components/ControlsPanel";
 import TradesTable from "@/components/TradesTable";
+import RunningStrategiesPanel from "@/components/RunningStrategiesPanel";
 import DailySummary from "@/components/DailySummary";
 import LogsViewer from "@/components/LogsViewer";
 
@@ -32,6 +33,7 @@ const Dashboard = () => {
 
           {/* Middle Column - Trades (6 cols) */}
           <div className="col-span-12 lg:col-span-6 flex flex-col gap-4">
+            <RunningStrategiesPanel />
             <TradesTable />
           </div>
 

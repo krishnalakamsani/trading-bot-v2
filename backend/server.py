@@ -5,6 +5,7 @@ All business logic is delegated to bot_service and other modules.
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
+from fastapi import Body
 from contextlib import asynccontextmanager
 import asyncio
 import logging
@@ -275,6 +276,25 @@ def _validate_strategy_config(cfg: dict) -> None:
     if ind not in ("supertrend", "supertrend_macd", "supertrend_adx", "score_mds"):
         raise ValueError("indicator_type must be 'supertrend', 'supertrend_macd', 'supertrend_adx', or 'score_mds'")
 
+    if "selected_index" in cfg and cfg["selected_index"] is not None:
+        try:
+            idx = str(cfg.get("selected_index") or "").strip().upper()
+        except Exception:
+            idx = ""
+        if idx:
+            from indices import get_available_indices
+            if idx not in set(get_available_indices() or []):
+                raise ValueError("selected_index is not a supported index")
+
+    if "candle_interval" in cfg and cfg["candle_interval"] is not None:
+        try:
+            tf = int(cfg.get("candle_interval") or 0)
+        except Exception:
+            tf = 0
+        allowed = {int(x.get('value')) for x in (bot_service.get_available_timeframes() or []) if isinstance(x, dict) and x.get('value') is not None}
+        if tf not in allowed:
+            raise ValueError("candle_interval is not a supported timeframe")
+
     # ADX validation (used by supertrend_adx)
     if "adx_period" in cfg and cfg["adx_period"] is not None:
         v = int(cfg["adx_period"])
@@ -313,10 +333,14 @@ async def get_status():
     return bot_service.get_bot_status()
 
 
+
+
 @api_router.get("/market/nifty")
 async def get_market_data():
     """Get market data (index LTP, SuperTrend)"""
     return bot_service.get_market_data()
+
+
 
 
 @api_router.get("/position")
@@ -344,8 +368,16 @@ async def get_summary():
 
 
 @api_router.get("/logs")
-async def get_logs(level: str = Query(default="all"), limit: int = Query(default=100, le=500)):
-    """Get bot logs"""
+async def get_logs(
+    level: str = Query(default="all"),
+    limit: int = Query(default=100, le=500),
+    strategy_id: int | None = Query(default=None),
+):
+    """Get bot logs.
+
+    When strategy_id is provided, only returns lines containing the tag
+    '[STRAT:<id>]' (emitted by portfolio strategy logging).
+    """
     logs = []
     log_file = ROOT_DIR / 'logs' / 'bot.log'
     
@@ -360,7 +392,14 @@ async def get_logs(level: str = Query(default="all"), limit: int = Query(default
                         log_level = parts[2]
                         message = ' - '.join(parts[3:])
                         
-                        if level == "all" or level.upper() == log_level:
+                        if level != "all" and level.upper() != log_level:
+                            continue
+
+                        if strategy_id is not None:
+                            tag = f"[STRAT:{int(strategy_id)}]"
+                            if tag not in message:
+                                continue
+
                             logs.append({
                                 "timestamp": timestamp,
                                 "level": log_level,
@@ -370,6 +409,15 @@ async def get_logs(level: str = Query(default="all"), limit: int = Query(default
                     pass
     
     return logs
+
+
+@api_router.post("/portfolio/strategies/{strategy_id}/squareoff")
+async def portfolio_squareoff_strategy(strategy_id: int):
+    """Square off only the specified strategy in portfolio mode."""
+    result = await bot_service.squareoff_portfolio_strategy(strategy_id)
+    if result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail=result.get('message') or 'Squareoff failed')
+    return result
 
 
 @api_router.get("/config")
@@ -428,6 +476,37 @@ async def stop_bot():
 async def squareoff():
     """Force square off position"""
     return await bot_service.squareoff_position()
+
+
+# ==================== Portfolio (Per-Strategy Controls) ====================
+
+@api_router.patch("/portfolio/strategies/{strategy_id}/instance")
+async def patch_portfolio_strategy_instance(strategy_id: int, patch: dict = Body(default={} )):
+    """Patch per-strategy portfolio instance settings.
+
+    Supported keys: active, mode, order_qty, target_points, initial_stoploss,
+    trail_start_profit, trail_step, max_loss_per_trade.
+    """
+    result = await bot_service.patch_portfolio_instance(strategy_id, patch or {})
+    if result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail=result.get('message') or 'Invalid request')
+    return result
+
+
+@api_router.post("/portfolio/strategies/{strategy_id}/start")
+async def start_portfolio_strategy(strategy_id: int):
+    result = await bot_service.patch_portfolio_instance(strategy_id, {'active': True})
+    if result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail=result.get('message') or 'Invalid request')
+    return result
+
+
+@api_router.post("/portfolio/strategies/{strategy_id}/stop")
+async def stop_portfolio_strategy(strategy_id: int):
+    result = await bot_service.patch_portfolio_instance(strategy_id, {'active': False})
+    if result.get('status') == 'error':
+        raise HTTPException(status_code=400, detail=result.get('message') or 'Invalid request')
+    return result
 
 
 # ==================== Strategies ====================

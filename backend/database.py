@@ -351,7 +351,23 @@ async def load_config():
                             'enable_internal_market_data_service',
                         }
 
-                        if key in int_keys:
+                        json_keys = {
+                            'portfolio_strategy_ids',
+                            'portfolio_instances',
+                        }
+
+                        if key in json_keys:
+                            try:
+                                parsed = json.loads(value) if value is not None else None
+                                if key == 'portfolio_strategy_ids':
+                                    config[key] = parsed if isinstance(parsed, list) else []
+                                elif key == 'portfolio_instances':
+                                    config[key] = parsed if isinstance(parsed, dict) else {}
+                                else:
+                                    config[key] = parsed
+                            except Exception:
+                                config[key] = [] if key == 'portfolio_strategy_ids' else {}
+                        elif key in int_keys:
                             config[key] = int(value)
                         elif key in float_keys:
                             config[key] = float(value)
@@ -445,8 +461,14 @@ async def prune_backend_market_data(*, vacuum: bool | None = None) -> dict:
 async def save_config():
     """Save config to database"""
     try:
+        import json
         async with aiosqlite.connect(DB_PATH) as db:
             for key, value in config.items():
+                if key in {'portfolio_strategy_ids', 'portfolio_instances'}:
+                    try:
+                        value = json.dumps(value)
+                    except Exception:
+                        value = str(value)
                 await db.execute(
                     'INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)',
                     (key, str(value))

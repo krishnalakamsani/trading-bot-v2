@@ -7,6 +7,126 @@ from database import save_config, load_config
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_portfolio_strategy_ids(raw) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    if isinstance(raw, str):
+        try:
+            import json
+            raw = json.loads(raw)
+        except Exception:
+            raw = []
+    if not isinstance(raw, list):
+        return ids
+    for v in raw:
+        try:
+            i = int(v)
+        except Exception:
+            continue
+        if i <= 0:
+            continue
+        if i in seen:
+            continue
+        seen.add(i)
+        ids.append(i)
+    return ids
+
+
+def _sanitize_portfolio_instances(raw) -> dict:
+    """Normalize portfolio_instances mapping.
+
+    Expected shape: {"<strategy_id>": {"active": bool, "mode": "paper"|"live", ...}}
+    Strategy IDs are returned as strings.
+    """
+    if isinstance(raw, str):
+        try:
+            import json
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        return {}
+
+    cleaned: dict[str, dict] = {}
+    allowed_timeframes = {int(x.get('value')) for x in (get_available_timeframes() or []) if isinstance(x, dict) and x.get('value') is not None}
+    for k, v in raw.items():
+        try:
+            sid = int(k)
+        except Exception:
+            continue
+        if sid <= 0:
+            continue
+        if not isinstance(v, dict):
+            v = {}
+
+        active = v.get('active')
+        if active is None:
+            active = True
+        active = bool(active)
+
+        mode = str(v.get('mode') or 'paper').strip().lower()
+        if mode not in {'paper', 'live'}:
+            mode = 'paper'
+
+        def _num(x, cast, default=None):
+            if x is None:
+                return default
+            try:
+                return cast(x)
+            except Exception:
+                return default
+
+        order_qty = _num(v.get('order_qty'), int, None)
+        if order_qty is not None:
+            order_qty = max(0, min(10, int(order_qty)))
+
+        target_points = _num(v.get('target_points'), float, None)
+        initial_stoploss = _num(v.get('initial_stoploss'), float, None)
+        trail_start_profit = _num(v.get('trail_start_profit'), float, None)
+        trail_step = _num(v.get('trail_step'), float, None)
+        max_loss_per_trade = _num(v.get('max_loss_per_trade'), float, None)
+
+        selected_index = v.get('selected_index')
+        if selected_index is not None:
+            try:
+                selected_index = str(selected_index).strip().upper()
+            except Exception:
+                selected_index = None
+            if selected_index and selected_index not in set(get_available_indices() or []):
+                selected_index = None
+
+        candle_interval = _num(v.get('candle_interval'), int, None)
+        if candle_interval is not None:
+            candle_interval = int(candle_interval)
+            if candle_interval not in allowed_timeframes:
+                candle_interval = None
+
+        inst = {
+            'active': active,
+            'mode': mode,
+        }
+        if selected_index is not None:
+            inst['selected_index'] = str(selected_index)
+        if candle_interval is not None:
+            inst['candle_interval'] = int(candle_interval)
+        if order_qty is not None:
+            inst['order_qty'] = int(order_qty)
+        if target_points is not None:
+            inst['target_points'] = float(target_points)
+        if initial_stoploss is not None:
+            inst['initial_stoploss'] = float(initial_stoploss)
+        if trail_start_profit is not None:
+            inst['trail_start_profit'] = float(trail_start_profit)
+        if trail_step is not None:
+            inst['trail_step'] = float(trail_step)
+        if max_loss_per_trade is not None:
+            inst['max_loss_per_trade'] = float(max_loss_per_trade)
+
+        cleaned[str(sid)] = inst
+
+    return cleaned
+
 # Lazy import to avoid circular imports
 _trading_bot = None
 
@@ -40,6 +160,18 @@ async def squareoff_position() -> dict:
     bot = get_trading_bot()
     result = await bot.squareoff()
     logger.info(f"[BOT] Squareoff requested: {result}")
+    return result
+
+
+async def squareoff_portfolio_strategy(strategy_id: int) -> dict:
+    """Square off only one strategy in portfolio mode."""
+    bot = get_trading_bot()
+    try:
+        result = await bot._portfolio_squareoff_strategy(strategy_id, reason="Manual Square-off")
+    except Exception as e:
+        logger.error(f"[BOT] Strategy squareoff failed: {e}")
+        return {"status": "error", "message": "Squareoff failed"}
+    logger.info(f"[BOT] Strategy squareoff requested: {result}")
     return result
 
 
@@ -189,8 +321,36 @@ def get_config() -> dict:
 
         # Portfolio (multi-strategy)
         "portfolio_enabled": bool(config.get('portfolio_enabled', False)),
-        "portfolio_strategy_ids": list(config.get('portfolio_strategy_ids', []) or []),
+        "portfolio_strategy_ids": _sanitize_portfolio_strategy_ids(config.get('portfolio_strategy_ids', []) or []),
+        "portfolio_instances": _sanitize_portfolio_instances(config.get('portfolio_instances', {}) or {}),
     }
+
+
+async def patch_portfolio_instance(strategy_id: int, patch: dict) -> dict:
+    """Patch a single strategy instance override in portfolio_instances."""
+    try:
+        sid = int(strategy_id)
+    except Exception:
+        return {"status": "error", "message": "Invalid strategy_id"}
+    if sid <= 0:
+        return {"status": "error", "message": "Invalid strategy_id"}
+
+    if not isinstance(patch, dict):
+        return {"status": "error", "message": "Patch must be an object"}
+
+    instances = _sanitize_portfolio_instances(config.get('portfolio_instances', {}) or {})
+    current = dict(instances.get(str(sid), {}) or {})
+    merged = dict(current)
+    merged.update(patch)
+
+    sanitized_one = _sanitize_portfolio_instances({str(sid): merged})
+    if str(sid) not in sanitized_one:
+        return {"status": "error", "message": "Invalid instance payload"}
+
+    instances[str(sid)] = sanitized_one[str(sid)]
+    config['portfolio_instances'] = instances
+    await save_config()
+    return {"status": "success", "strategy_id": sid, "instance": instances[str(sid)]}
 
 
 async def update_config_values(updates: dict) -> dict:
@@ -379,16 +539,17 @@ async def update_config_values(updates: dict) -> dict:
 
     if updates.get('portfolio_strategy_ids') is not None:
         raw = updates.get('portfolio_strategy_ids')
-        ids: list[int] = []
-        if isinstance(raw, list):
-            for v in raw:
-                try:
-                    ids.append(int(v))
-                except Exception:
-                    continue
+        ids = _sanitize_portfolio_strategy_ids(raw)
         config['portfolio_strategy_ids'] = ids
         updated_fields.append('portfolio_strategy_ids')
         logger.info(f"[CONFIG] Portfolio strategy IDs: {config['portfolio_strategy_ids']}")
+
+    if updates.get('portfolio_instances') is not None:
+        raw = updates.get('portfolio_instances')
+        instances = _sanitize_portfolio_instances(raw)
+        config['portfolio_instances'] = instances
+        updated_fields.append('portfolio_instances')
+        logger.info(f"[CONFIG] Portfolio instances updated: {list(instances.keys())}")
 
     if updates.get('macd_confirmation_enabled') is not None:
         config['macd_confirmation_enabled'] = str(updates['macd_confirmation_enabled']).lower() in ('true', '1', 'yes')
