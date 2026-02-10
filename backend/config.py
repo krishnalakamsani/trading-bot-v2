@@ -137,6 +137,13 @@ config = {
     # Automatically falls back to synthetic pricing if Dhan is not configured.
     "paper_use_live_option_quotes": _env_bool("PAPER_USE_LIVE_OPTION_QUOTES", True),
 
+    # If True: in paper mode, when live option quotes are enabled, skip entries
+    # unless a live option LTP could be fetched.
+    "paper_entry_require_live_ltp": _env_bool("PAPER_ENTRY_REQUIRE_LIVE_LTP", True),
+
+    # Option LTP fallback: if live fetch fails, allow using a very recent last-good LTP.
+    "ltp_last_good_max_age_seconds": _env_float("LTP_LAST_GOOD_MAX_AGE_SECONDS", 2.0),
+
     # Testing
     "bypass_market_hours": False,  # If True: allow running logic outside 9:15-15:30 IST
     # Signal & Indicator Settings

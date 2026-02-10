@@ -123,6 +123,26 @@ async def init_db():
         except Exception as e:
             logger.error(f"[DB] Trades migration error (strategy_id): {e}")
 
+        # Migration: Add option_security_id, used_ltp, ltp_source if they don't exist
+        try:
+            cursor = await db.execute("PRAGMA table_info(trades)")
+            columns = [row[1] for row in await cursor.fetchall()]
+            added = False
+            if 'option_security_id' not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN option_security_id TEXT DEFAULT ''")
+                added = True
+            if 'used_ltp' not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN used_ltp REAL DEFAULT 0.0")
+                added = True
+            if 'ltp_source' not in columns:
+                await db.execute("ALTER TABLE trades ADD COLUMN ltp_source TEXT DEFAULT ''")
+                added = True
+            if added:
+                await db.commit()
+                logger.info("[DB] Added option_security_id/used_ltp/ltp_source columns to trades table")
+        except Exception as e:
+            logger.error(f"[DB] Trades migration error (ltp columns): {e}")
+
         # Migration: add interval_seconds to candle_data if table existed before
         try:
             cursor = await db.execute("PRAGMA table_info(candle_data)")

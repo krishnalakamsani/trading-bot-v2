@@ -1,3 +1,7 @@
+"""
+Dhan API wrapper
+Implements in-memory LTP cache and option chain throttle for rate limit compliance.
+"""
 # Dhan API wrapper
 try:
     from dhanhq import dhanhq  # type: ignore
@@ -32,6 +36,9 @@ class DhanAPI:
         self._option_chain_cache_time = {}
         self._cache_duration = 60  # Default cache for 60 seconds
         self._position_cache_duration = 10  # Shorter cache when position is open
+        # In-memory LTP cache: {security_id: (ltp, timestamp)}
+        self._ltp_cache = {}
+        self._ltp_cache_ttl = 1.0  # seconds
 
     def _extract_option_chain_oc(self, chain: dict) -> object:
         """Extract option-chain 'oc' payload from Dhan response.
@@ -53,6 +60,19 @@ class DhanAPI:
 
     def _match_strike_node(self, oc_data: object, strike: int) -> tuple:
         """Return (matched_key, strike_node_dict) for a given strike.
+    # Global API call counters (class-level)
+    api_call_counts = {
+        'quote_data': 0,
+        'option_chain': 0,
+        'expiry_list': 0,
+        'place_order': 0,
+        'verify_order_filled': 0,
+    }
+
+    @classmethod
+    def log_api_call(cls, api_name):
+        cls.api_call_counts[api_name] = cls.api_call_counts.get(api_name, 0) + 1
+        logger.info(f"[API MONITOR] {api_name} calls: {cls.api_call_counts[api_name]}")
 
         Handles oc_data as either dict keyed by strike (stringified floats) or
         a list of strike entries.
@@ -67,7 +87,8 @@ class DhanAPI:
                 f"{strike}.000000",
                 f"{strike}.0000",
                 f"{strike}.00",
-                f"{strike}.0",
+                self.log_api_call('quote_data')
+                response = self.dhan.quote_data({
                 str(strike),
             ]
             for key in candidate_keys:
@@ -267,17 +288,16 @@ class DhanAPI:
                 logger.error("Could not determine expiry date")
                 return {}
             
-            # Check cache
+            # Check cache and throttle: Dhan allows 1 unique option chain request per 3s
             cache_key = f"{index_name}_{expiry}"
             now = datetime.now()
-            
-            cache_duration = self._position_cache_duration if bot_state.get('current_position') else self._cache_duration
-            
             cache_time = self._option_chain_cache_time.get(cache_key)
+            min_chain_interval = 3.0  # seconds
             if (not force_refresh and 
                 self._option_chain_cache.get(cache_key) and 
                 cache_time and 
-                (now - cache_time).seconds < cache_duration):
+                (now - cache_time).total_seconds() < min_chain_interval):
+                logger.info(f"[OPTION CHAIN CACHE] Returning cached option chain for {cache_key} (age={(now-cache_time).total_seconds():.2f}s)")
                 return self._option_chain_cache[cache_key]
             
             logger.info(f"Fetching fresh option chain: {index_name}, expiry={expiry}")
@@ -449,6 +469,17 @@ class DhanAPI:
         return ""
     
     async def get_option_ltp(self, security_id: str, strike: int = None, option_type: str = None, expiry: str = None, index_name: str = "NIFTY", force_refresh: bool = False) -> float:
+        # In-memory LTP cache to avoid duplicate API calls within a short window
+        import time
+        cache_key = str(security_id)
+        now = time.time()
+        if not force_refresh:
+            cached = self._ltp_cache.get(cache_key)
+            if cached:
+                ltp, ts = cached
+                if (now - ts) < self._ltp_cache_ttl and ltp and float(ltp) > 0:
+                    logger.info(f"[LTP CACHE] Returning cached LTP for security_id={security_id}: {ltp} (age={now-ts:.2f}s)")
+                    return float(ltp)
         """Get option LTP from cache or API"""
         try:
             index_config = get_index_config(index_name)
@@ -484,24 +515,31 @@ class DhanAPI:
                         logger.debug(f"Option chain cache too old or missing time (age={age}); skipping cache for LTP: {cache_key}")
             
             # Fallback: Make API call
+
             logger.info(f"Fetching option LTP for security_id: {security_id}")
             response = self.dhan.quote_data({
                 fno_segment: [int(security_id)]
             })
-            
+
+            logger.info(f"Option LTP raw response for security_id={security_id}: {response}")
+
             if response and response.get('status') == 'success':
                 data = response.get('data', {})
                 if isinstance(data, dict) and 'data' in data:
                     data = data.get('data', {})
-                
+
                 fno_data = data.get(fno_segment, {}).get(str(security_id), {})
+                logger.info(f"Option LTP parsed fno_data for security_id={security_id}: {fno_data}")
                 if fno_data:
                     ltp = fno_data.get('last_price')
+                    logger.info(f"Option LTP extracted last_price for security_id={security_id}: {ltp}")
                     if ltp and ltp > 0:
+                        # Save to in-memory cache
+                        self._ltp_cache[cache_key] = (ltp, now)
                         return float(ltp)
-                        
+
         except Exception as e:
-            logger.error(f"Error fetching option LTP: {e}")
+            logger.error(f"Error fetching option LTP: {e}", exc_info=True)
         return 0
     
     async def place_order(self, security_id: str, transaction_type: str, qty: int, index_name: str = None) -> dict:
