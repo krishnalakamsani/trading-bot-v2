@@ -400,11 +400,11 @@ async def get_logs(
                             if tag not in message:
                                 continue
 
-                            logs.append({
-                                "timestamp": timestamp,
-                                "level": log_level,
-                                "message": message
-                            })
+                        logs.append({
+                            "timestamp": timestamp,
+                            "level": log_level,
+                            "message": message
+                        })
                 except Exception:
                     pass
     

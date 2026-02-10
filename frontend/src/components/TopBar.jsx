@@ -1,7 +1,7 @@
 import React, { useContext } from "react";
 import { useNavigate } from "react-router-dom";
 import { AppContext } from "@/App";
-import { Settings, Wifi, WifiOff, Clock, TrendingUp, BarChart3 } from "lucide-react";
+import { Settings, Wifi, WifiOff, TrendingUp, BarChart3 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 const TopBar = ({ onSettingsClick }) => {
@@ -43,14 +43,6 @@ const TopBar = ({ onSettingsClick }) => {
 
   const strategyCount = portfolioEnabled ? activePortfolioIds.length : 1;
 
-  // Format timeframe for display
-  const formatTimeframe = (seconds) => {
-    if (!seconds) return "5s";
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${seconds / 60}m`;
-    return `${seconds / 3600}h`;
-  };
-
   return (
     <div
       className="bg-white border-b border-gray-200 px-4 lg:px-6 py-3 flex items-center justify-between"
@@ -73,21 +65,6 @@ const TopBar = ({ onSettingsClick }) => {
 
       {/* Center - Status Indicators */}
       <div className="hidden md:flex items-center gap-4">
-        {/* Index Badge */}
-        <div className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 rounded-sm">
-          <span className="text-xs font-medium text-blue-700">
-            {config.selected_index || "NIFTY"}
-          </span>
-        </div>
-
-        {/* Timeframe Badge */}
-        <div className="flex items-center gap-1.5 px-2.5 py-1 bg-purple-50 rounded-sm">
-          <Clock className="w-3 h-3 text-purple-600" />
-          <span className="text-xs font-medium text-purple-700">
-            {formatTimeframe(botStatus.candle_interval || config.candle_interval)}
-          </span>
-        </div>
-
         {/* Bot Status */}
         <div
           className={`status-badge ${
@@ -101,27 +78,6 @@ const TopBar = ({ onSettingsClick }) => {
             }`}
           />
           {botStatus.is_running ? "Running" : "Stopped"}
-        </div>
-
-        {/* Trading Paused Indicator */}
-        {botStatus.is_running && botStatus.trading_enabled === false && (
-          <div
-            className="status-badge status-warning"
-            data-testid="trading-paused-badge"
-            title="Entries paused: bot keeps updating indicators/prices"
-          >
-            PAUSED
-          </div>
-        )}
-
-        {/* Mode Status */}
-        <div
-          className={`status-badge ${
-            botStatus.mode === "live" ? "status-warning" : "status-info"
-          }`}
-          data-testid="mode-badge"
-        >
-          {botStatus.mode === "live" ? "LIVE" : "PAPER"}
         </div>
 
         {/* Strategies Count */}

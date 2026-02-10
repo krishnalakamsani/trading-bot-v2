@@ -24,6 +24,9 @@ async def init_db():
                 qty INTEGER,
                 pnl REAL,
                 exit_reason TEXT,
+                option_security_id TEXT,
+                used_ltp REAL,
+                ltp_source TEXT,
                 mode TEXT,
                 index_name TEXT,
                 created_at TEXT
@@ -482,8 +485,8 @@ async def save_trade(trade_data: dict):
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute('''
-                INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, strategy_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO trades (trade_id, entry_time, option_type, strike, expiry, entry_price, qty, mode, index_name, strategy_id, option_security_id, used_ltp, ltp_source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_data['trade_id'],
                 trade_data['entry_time'],
@@ -495,6 +498,9 @@ async def save_trade(trade_data: dict):
                 trade_data['mode'],
                 trade_data.get('index_name', 'NIFTY'),
                 str(trade_data.get('strategy_id', '') or ''),
+                str(trade_data.get('option_security_id') or ''),
+                float(trade_data.get('used_ltp') or 0.0),
+                str(trade_data.get('ltp_source') or ''),
                 trade_data['created_at']
             ))
             await db.commit()

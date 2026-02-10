@@ -28,6 +28,7 @@ async def fetch_latest_close(
     symbol: str,
     timeframe_seconds: int,
     min_poll_seconds: float = 1.0,
+    force_refresh: bool = False,
 ) -> tuple[float | None, str | None]:
     """Fetch latest candle close from market-data-service.
 
@@ -43,7 +44,7 @@ async def fetch_latest_close(
 
     key = (str(symbol or '').strip().upper(), int(timeframe_seconds))
     cached = _close_cache.get(key)
-    if cached is not None:
+    if cached is not None and not force_refresh:
         cached_price, cached_ts, last_fetch = cached
         if (now - float(last_fetch or 0.0)) < min_poll_seconds:
             return cached_price, cached_ts
@@ -211,6 +212,7 @@ async def fetch_latest_candle(
     symbol: str,
     timeframe_seconds: int,
     min_poll_seconds: float = 1.0,
+    force_refresh: bool = False,
 ) -> dict[str, Any] | None:
     """Fetch latest full candle from market-data-service.
 
@@ -226,7 +228,7 @@ async def fetch_latest_candle(
 
     key = (str(symbol or '').strip().upper(), int(timeframe_seconds))
     cached = _candle_cache.get(key)
-    if cached is not None:
+    if cached is not None and not force_refresh:
         cached_candle, _cached_ts, last_fetch = cached
         if (now - float(last_fetch or 0.0)) < min_poll_seconds:
             return cached_candle

@@ -89,6 +89,21 @@ const Settings = () => {
     Array.isArray(config.portfolio_strategy_ids) ? config.portfolio_strategy_ids : []
   );
 
+  const allSavedStrategyIds = React.useMemo(() => {
+    const seen = new Set();
+    const ids = [];
+    for (const s of strategies || []) {
+      const n = Number(s?.id);
+      if (!Number.isFinite(n)) continue;
+      const id = Math.trunc(n);
+      if (id <= 0) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      ids.push(id);
+    }
+    return ids;
+  }, [strategies]);
+
   const [saving, setSaving] = useState(false);
   const isFirstRender = React.useRef(true);
 
@@ -218,28 +233,26 @@ const Settings = () => {
     setBypassMarketHoursUpdating(false);
   };
 
-  const togglePortfolioStrategy = (id, checked) => {
-    const numericId = Number(id);
-    if (!Number.isFinite(numericId)) return;
-    const next = new Set((portfolioStrategyIds || []).map((x) => Number(x)));
-    if (checked) next.add(numericId);
-    else next.delete(numericId);
-    setPortfolioStrategyIds(Array.from(next));
-  };
+  // Portfolio selection policy: include ALL saved strategies.
+  useEffect(() => {
+    if (!portfolioEnabled) return;
+    setPortfolioStrategyIds(allSavedStrategyIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portfolioEnabled, strategies]);
 
   const handleSavePortfolioParams = async () => {
     if (!canChangeRunContext) {
       toast.error("Stop the bot and close position first");
       return;
     }
-    if (portfolioEnabled && (portfolioStrategyIds || []).length === 0) {
-      toast.error("Select at least one saved strategy");
+    if (portfolioEnabled && (allSavedStrategyIds || []).length === 0) {
+      toast.error("No saved strategies found. Save at least one strategy first.");
       return;
     }
     setSaving(true);
     await updateConfig({
       portfolio_enabled: !!portfolioEnabled,
-      portfolio_strategy_ids: (portfolioStrategyIds || []).map((x) => Number(x)).filter((x) => Number.isFinite(x)),
+      portfolio_strategy_ids: portfolioEnabled ? allSavedStrategyIds : [],
     });
     setSaving(false);
   };
@@ -1169,7 +1182,7 @@ const Settings = () => {
             <div className="space-y-3 p-4 bg-gray-50 rounded-sm border border-gray-100">
               <div className="text-sm font-medium text-gray-900">Portfolio Mode (Multiple strategies)</div>
               <div className="text-xs text-gray-500">
-                Enable to run multiple saved strategies at the same time (paper mode). Choose which saved strategies to run.
+                Enable to run multiple saved strategies at the same time. All saved strategies are included in the portfolio.
               </div>
 
               <div className="flex items-center justify-between">
@@ -1187,7 +1200,7 @@ const Settings = () => {
 
               {portfolioEnabled ? (
                 <div className="space-y-2">
-                  <Label className="text-xs text-gray-600">Select strategies to run</Label>
+                  <Label className="text-xs text-gray-600">Strategies in portfolio</Label>
                   <div className="max-h-48 overflow-auto rounded-sm border border-gray-200 bg-white p-2">
                     {(strategies || []).length === 0 ? (
                       <div className="text-xs text-gray-500">No saved strategies found. Save one in the Strategy tab first.</div>
@@ -1195,16 +1208,14 @@ const Settings = () => {
                       <div className="space-y-2">
                         {(strategies || []).map((s) => {
                           const sid = Number(s.id);
-                          const checked = (portfolioStrategyIds || []).map((x) => Number(x)).includes(sid);
                           return (
                             <label
                               key={s.id}
                               className="flex items-center gap-2 text-sm text-gray-800 cursor-pointer"
                             >
                               <Checkbox
-                                checked={checked}
-                                onCheckedChange={(v) => togglePortfolioStrategy(sid, v === true)}
-                                disabled={!canChangeRunContext}
+                                checked={(portfolioStrategyIds || []).map((x) => Number(x)).includes(sid)}
+                                disabled
                                 data-testid={`portfolio-strategy-${s.id}`}
                               />
                               <span className="text-sm">{s.name}</span>

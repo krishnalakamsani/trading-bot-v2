@@ -4,7 +4,7 @@ import { API, AppContext } from "@/App";
 import { Layers } from "lucide-react";
 
 const RunningStrategiesPanel = () => {
-  const { config, timeframes, botStatus, fetchData, portfolioPositions, portfolioStrategiesState } = useContext(AppContext);
+  const { config, timeframes, botStatus, fetchData, portfolioPositions, portfolioStrategiesState, startBot } = useContext(AppContext);
 
   const indexOptions = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"];
 
@@ -35,7 +35,7 @@ const RunningStrategiesPanel = () => {
   useEffect(() => {
     let cancelled = false;
 
-    const shouldFetch = portfolioEnabled && portfolioIds.length > 0;
+    const shouldFetch = portfolioEnabled;
     if (!shouldFetch) {
       setStrategies([]);
       setLoadError(null);
@@ -62,7 +62,7 @@ const RunningStrategiesPanel = () => {
     return () => {
       cancelled = true;
     };
-  }, [portfolioEnabled, portfolioIds.join(",")]);
+  }, [portfolioEnabled]);
 
   const strategyById = useMemo(() => {
     const map = new Map();
@@ -87,7 +87,7 @@ const RunningStrategiesPanel = () => {
   const displayIds = useMemo(() => {
     if (!portfolioEnabled) return [];
     if (loading || loadError) return portfolioIds;
-    return portfolioIds.filter((id) => knownStrategyIds.has(id));
+    return Array.from(knownStrategyIds).sort((a, b) => a - b);
   }, [portfolioEnabled, portfolioIds, loading, loadError, knownStrategyIds]);
 
   const strategyCount = portfolioEnabled ? displayIds.length : 1;
@@ -361,7 +361,13 @@ const RunningStrategiesPanel = () => {
                             <button
                               className="text-xs px-2 py-1 rounded-sm border border-gray-200 bg-white text-gray-700 hover:bg-gray-100 disabled:opacity-50"
                               disabled={isSaving}
-                              onClick={() => patchInstance(id, { active: !(draft.active !== false) })}
+                              onClick={async () => {
+                                const enable = draft.active === false;
+                                const ok = await patchInstance(id, { active: enable });
+                                if (ok && enable && !botStatus?.is_running) {
+                                  await startBot();
+                                }
+                              }}
                               title="Start/stop this strategy without affecting others"
                             >
                               {draft.active !== false ? "Stop" : "Start"}

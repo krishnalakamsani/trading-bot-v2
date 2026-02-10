@@ -448,28 +448,40 @@ class DhanAPI:
             logger.error(f"Error getting ATM option security ID: {e}")
         return ""
     
-    async def get_option_ltp(self, security_id: str, strike: int = None, option_type: str = None, expiry: str = None, index_name: str = "NIFTY") -> float:
+    async def get_option_ltp(self, security_id: str, strike: int = None, option_type: str = None, expiry: str = None, index_name: str = "NIFTY", force_refresh: bool = False) -> float:
         """Get option LTP from cache or API"""
         try:
             index_config = get_index_config(index_name)
             fno_segment = index_config.get("fno_segment", "NSE_FNO")
             
-            # First try from cached option chain
+            # Prefer live quote. If force_refresh is requested, skip using the option-chain cache
+            # and fall back to a direct quote API call for the latest price.
             if strike and option_type:
                 cache_key = f"{index_name}_{expiry}" if expiry else None
-                if cache_key and self._option_chain_cache.get(cache_key):
-                    chain = self._option_chain_cache[cache_key]
-                    oc_data = self._extract_option_chain_oc(chain)
-                    _, strike_node = self._match_strike_node(oc_data, strike)
+                if not force_refresh and cache_key and self._option_chain_cache.get(cache_key):
+                    cache_time = self._option_chain_cache_time.get(cache_key)
+                    try:
+                        age = (datetime.now() - cache_time).total_seconds() if cache_time else None
+                    except Exception:
+                        age = None
 
-                    if isinstance(strike_node, dict) and strike_node:
-                        opt_key = 'ce' if option_type.upper() == 'CE' else 'pe'
-                        opt_data = strike_node.get(opt_key, {})
-                        if isinstance(opt_data, dict):
-                            ltp = opt_data.get('last_price', 0) or opt_data.get('lastPrice', 0)
-                            if ltp and float(ltp) > 0:
-                                logger.info(f"Got option LTP from cache: {index_name} {strike} {option_type} = {ltp}")
-                                return float(ltp)
+                    # Use a small freshness window for LTP from chain cache (seconds).
+                    ltp_cache_max_age = min(2.0, float(self._position_cache_duration or 2))
+                    if age is not None and age < float(ltp_cache_max_age):
+                        chain = self._option_chain_cache[cache_key]
+                        oc_data = self._extract_option_chain_oc(chain)
+                        _, strike_node = self._match_strike_node(oc_data, strike)
+
+                        if isinstance(strike_node, dict) and strike_node:
+                            opt_key = 'ce' if option_type.upper() == 'CE' else 'pe'
+                            opt_data = strike_node.get(opt_key, {})
+                            if isinstance(opt_data, dict):
+                                ltp = opt_data.get('last_price', 0) or opt_data.get('lastPrice', 0)
+                                if ltp and float(ltp) > 0:
+                                    logger.info(f"Got option LTP from cache: {index_name} {strike} {option_type} = {ltp} (age={age:.2f}s)")
+                                    return float(ltp)
+                    else:
+                        logger.debug(f"Option chain cache too old or missing time (age={age}); skipping cache for LTP: {cache_key}")
             
             # Fallback: Make API call
             logger.info(f"Fetching option LTP for security_id: {security_id}")

@@ -17,7 +17,7 @@ from score_engine import ScoreEngine, Candle
 from strategies.runner import ScoreMdsRunner, SuperTrendAdxRunner, SuperTrendMacdRunner
 from strategies.runtime import ClosedCandleContext, ScoreMdsRuntime, SuperTrendRuntime, build_strategy_runtime
 from dhan_api import DhanAPI
-from database import save_trade, update_trade_exit, get_strategy
+from database import save_trade, update_trade_exit, get_strategy, list_strategies
 from portfolio import PortfolioPosition, PortfolioStrategy
 
 logger = logging.getLogger(__name__)
@@ -157,12 +157,14 @@ class TradingBot:
 
                 if security_id and not security_id.startswith('SIM_'):
                     try:
-                        ltp = await self.dhan.get_option_ltp(
+                        ltp = await self._fetch_option_ltp_retry(
                             security_id=str(security_id),
                             strike=int(strike),
                             option_type=str(option_type),
                             expiry=str(expiry),
                             index_name=str(index_name),
+                            retries=3,
+                            delay=0.15,
                         )
                         if ltp and float(ltp) > 0:
                             ltp = round(float(ltp) / 0.05) * 0.05
@@ -269,34 +271,51 @@ class TradingBot:
         return int(max(50, base_needed + 5))
 
     async def _seed_indicators_from_mds_history(self) -> None:
-        if str(config.get('market_data_provider', 'dhan') or 'dhan').strip().lower() != 'mds':
-            return
         if not bool(config.get('prefetch_candles_on_start', True)):
-            return
-
-        base_url = str(config.get('mds_base_url', '') or '').strip()
-        if not base_url:
             return
 
         index_name = str(config.get('selected_index', 'NIFTY') or 'NIFTY').strip().upper()
         interval = int(config.get('candle_interval', 5) or 5)
         limit = self._prefetch_candles_needed()
 
-        try:
-            from mds_client import fetch_last_candles
+        candles = []
 
-            candles = await fetch_last_candles(
-                base_url=base_url,
-                symbol=index_name,
-                timeframe_seconds=interval,
-                limit=limit,
-            )
-        except Exception as e:
-            logger.warning(f"[WARMUP] Prefetch failed (MDS): {e}")
-            return
+        # Try MDS first if configured
+        provider = str(config.get('market_data_provider', 'dhan') or 'dhan').strip().lower()
+        logger.info(f"[WARMUP] Prefetch provider={provider} index={index_name} interval={interval} limit={limit}")
+        if provider == 'mds':
+            base_url = str(config.get('mds_base_url', '') or '').strip()
+            logger.info(f"[WARMUP] MDS base_url='{base_url}'")
+            if base_url:
+                try:
+                    from mds_client import fetch_last_candles
+
+                    candles = await fetch_last_candles(
+                        base_url=base_url,
+                        symbol=index_name,
+                        timeframe_seconds=interval,
+                        limit=limit,
+                    )
+                    logger.info(f"[WARMUP] MDS returned {len(candles) if candles else 0} candles")
+                except Exception as e:
+                    logger.warning(f"[WARMUP] Prefetch failed (MDS): {e}")
+            else:
+                logger.warning("[WARMUP] MDS configured as provider but MDS_BASE_URL is empty")
+
+        # If MDS not available or returned no candles, try DB replay/cached candles
+        if not candles:
+            try:
+                from database import get_candle_data_for_replay
+
+                db_candles = await get_candle_data_for_replay(index_name=index_name, interval_seconds=interval, date_ist=None, limit=limit)
+                if db_candles:
+                    # `get_candle_data_for_replay` already returns ascending list
+                    candles = db_candles
+            except Exception as e:
+                logger.debug(f"[WARMUP] DB candle replay not available: {e}")
 
         if not candles:
-            logger.info("[WARMUP] No candles returned from MDS (skipping seed)")
+            logger.info("[WARMUP] No historical candles available (skipping seed)")
             return
 
         # Reset any MDS-derived HTF aggregation state
@@ -594,6 +613,50 @@ class TradingBot:
         logger.warning("[ERROR] Dhan API credentials not configured")
         return False
 
+    async def _fetch_option_ltp_retry(self, security_id: str, strike: int, option_type: str, expiry: str, index_name: str, retries: int = 3, delay: float = 0.15) -> float:
+        """Fetch option LTP with a short retry loop, forcing a fresh quote each attempt.
+
+        Returns 0 on failure.
+        """
+        if not self.dhan:
+            try:
+                self.initialize_dhan()
+            except Exception:
+                pass
+        if not self.dhan:
+            return 0.0
+
+        attempt = 0
+        last_err = None
+        while attempt < int(retries):
+            try:
+                logger.debug(f"[LTP RETRY] attempt={attempt+1}/{retries} security_id={security_id} strike={strike} opt={option_type} expiry={expiry}")
+                ltp = await self.dhan.get_option_ltp(
+                    security_id=str(security_id),
+                    strike=int(strike),
+                    option_type=str(option_type).upper(),
+                    expiry=str(expiry),
+                    index_name=str(index_name),
+                    force_refresh=True,
+                )
+                try:
+                    if ltp and float(ltp) > 0:
+                        logger.info(f"[LTP RETRY] success security_id={security_id} ltp={ltp} (attempt {attempt+1})")
+                        return float(ltp)
+                except Exception as e:
+                    last_err = e
+            except Exception as e:
+                last_err = e
+
+            attempt += 1
+            try:
+                await asyncio.sleep(float(delay))
+            except Exception:
+                pass
+
+        logger.warning(f"[LTP RETRY] failed to fetch LTP for security_id={security_id} strike={strike} opt={option_type} expiry={expiry} after {retries} attempts; last_err={last_err}")
+        return 0.0
+
     def _paper_should_use_live_option_quotes(self) -> bool:
         if bot_state.get('mode') != 'paper':
             return False
@@ -643,12 +706,14 @@ class TradingBot:
             if not live_security_id:
                 return False
 
-            option_ltp = await self.dhan.get_option_ltp(
+            option_ltp = await self._fetch_option_ltp_retry(
                 security_id=live_security_id,
                 strike=strike,
                 option_type=option_type,
                 expiry=expiry,
                 index_name=index_name,
+                retries=3,
+                delay=0.15,
             )
             if not option_ltp or float(option_ltp) <= 0:
                 return False
@@ -817,13 +882,30 @@ class TradingBot:
 
     def _portfolio_enabled(self) -> bool:
         try:
-            return bool(config.get('portfolio_enabled')) and bool(config.get('portfolio_strategy_ids'))
+            # Portfolio is considered enabled when the flag is on.
+            # Strategy IDs may be empty; in that case we auto-load all saved strategies.
+            return bool(config.get('portfolio_enabled'))
         except Exception:
             return False
 
     async def _portfolio_load_strategies(self) -> None:
         ids = config.get('portfolio_strategy_ids') or []
-        normalized = tuple(int(x) for x in ids if str(x).isdigit())
+
+        normalized_list: list[int] = []
+        try:
+            normalized_list = [int(x) for x in ids if str(x).isdigit()]
+        except Exception:
+            normalized_list = []
+
+        # If ids are not configured, load all saved strategies.
+        if not normalized_list:
+            try:
+                all_meta = await list_strategies()
+                normalized_list = [int(s.get('id')) for s in (all_meta or []) if str(s.get('id')).isdigit()]
+            except Exception:
+                normalized_list = []
+
+        normalized = tuple(normalized_list)
         instances = config.get('portfolio_instances') or {}
 
         # Reload full strategy list only when IDs change.
@@ -971,6 +1053,8 @@ class TradingBot:
             max_loss_per_trade = 0.0
 
         entry_price = 0.0
+        used_ltp = 0.0
+        used_ltp_source = 'simulated'
         security_id = f"SIM_{index_name}_{expiry}_{int(strike)}_{str(option_type).upper()}"
         trade_id = f"SIM_{int(time.time())}_{random.randint(1000, 9999)}"
 
@@ -982,13 +1066,24 @@ class TradingBot:
 
             try:
                 live_security_id = await self.dhan.get_atm_option_security_id(index_name, int(strike), str(option_type).upper(), expiry)
-            except Exception:
+            except Exception as e:
                 live_security_id = ''
+                logger.debug(f"[PORTFOLIO] get_atm_option_security_id error: {e}")
             if not live_security_id:
                 logger.error('[PORTFOLIO] LIVE entry failed: unable to resolve option security_id')
                 return
 
             security_id = str(live_security_id)
+            # Try a combined index+option quote first to reduce race conditions
+            try:
+                import asyncio as _asyncio
+                idx_ltp, opt_ltp = await _asyncio.to_thread(self.dhan.get_index_and_option_ltp, index_name, int(live_security_id))
+                if opt_ltp and float(opt_ltp) > 0:
+                    used_ltp = float(opt_ltp)
+                    used_ltp_source = 'dhan_combined'
+            except Exception:
+                pass
+
             order = await self.dhan.place_order(
                 security_id=str(security_id),
                 transaction_type='BUY',
@@ -1009,30 +1104,63 @@ class TradingBot:
             if not filled.get('filled'):
                 logger.error('[PORTFOLIO] LIVE BUY not filled: %s', filled)
                 return
-
             try:
                 entry_price = float(filled.get('average_price') or 0.0)
+                if entry_price and float(entry_price) > 0:
+                    used_ltp = float(entry_price)
+                    used_ltp_source = 'dhan_filled'
             except Exception:
                 entry_price = 0.0
+            logger.info(f"[PORTFOLIO] fill avg_price={entry_price} security_id={security_id} trade_id={trade_id}")
             if entry_price <= 0:
                 try:
-                    ltp = await self.dhan.get_option_ltp(
+                    logger.info(f"[PORTFOLIO] attempting LTP retry for security_id={security_id} before accepting entry")
+                    ltp = await self._fetch_option_ltp_retry(
                         security_id=str(security_id),
                         strike=int(strike),
                         option_type=str(option_type).upper(),
                         expiry=str(expiry),
                         index_name=str(index_name),
+                        retries=3,
+                        delay=0.15,
                     )
+                    logger.info(f"[PORTFOLIO] LTP retry result={ltp} for security_id={security_id}")
                     if ltp and float(ltp) > 0:
                         entry_price = float(round(round(float(ltp) / 0.05) * 0.05, 2))
-                except Exception:
-                    pass
+                        used_ltp = float(entry_price)
+                        used_ltp_source = 'dhan_retry'
+                except Exception as e:
+                    logger.debug(f"[PORTFOLIO] LTP retry error: {e}")
             if entry_price <= 0:
                 logger.error('[PORTFOLIO] LIVE entry price missing; aborting position open')
                 return
 
         else:
+            # Try to refresh the index close right before computing simulated option price
+            # to avoid using a stale cached close.
+            try:
+                from mds_client import fetch_latest_close
+
+                base_url = str(config.get('mds_base_url', '') or '').strip()
+                try:
+                    fresh_close, _ts = await fetch_latest_close(
+                        base_url=base_url,
+                        symbol=index_name,
+                        timeframe_seconds=int(config.get('candle_interval', candle_interval) or candle_interval),
+                        min_poll_seconds=0.2,
+                        force_refresh=True,
+                    )
+                    if fresh_close and float(fresh_close) > 0:
+                        index_close = float(fresh_close)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
             entry_price = float(self._get_simulated_option_price(float(index_close), int(strike), str(option_type)))
+            logger.info(
+                f"[PORTFOLIO] PAPER entry simulated | index_close={index_close} strike={strike} opt={option_type} => simulated_price={entry_price}"
+            )
 
             # During market hours, try to use live option quotes even in paper mode.
             if self._paper_should_use_live_option_quotes():
@@ -1045,17 +1173,23 @@ class TradingBot:
                     try:
                         live_security_id = await self.dhan.get_atm_option_security_id(index_name, int(strike), str(option_type).upper(), expiry)
                         if live_security_id:
-                            ltp = await self.dhan.get_option_ltp(
+                            logger.info(f"[PORTFOLIO] PAPER live-quote resolved secid={live_security_id}; attempting LTP fetch")
+                            ltp = await self._fetch_option_ltp_retry(
                                 security_id=str(live_security_id),
                                 strike=int(strike),
                                 option_type=str(option_type).upper(),
                                 expiry=str(expiry),
                                 index_name=str(index_name),
+                                retries=3,
+                                delay=0.15,
                             )
+                            logger.info(f"[PORTFOLIO] PAPER live-quote LTP result={ltp} for secid={live_security_id}")
                             if ltp and float(ltp) > 0:
                                 ltp = round(float(ltp) / 0.05) * 0.05
                                 entry_price = float(round(float(ltp), 2))
                                 security_id = str(live_security_id)
+                                used_ltp = float(entry_price)
+                                used_ltp_source = 'dhan_paper_live'
                     except Exception:
                         pass
 
@@ -1098,6 +1232,9 @@ class TradingBot:
             'mode': str(mode),
             'index_name': str(index_name),
             'strategy_id': str(strategy.strategy_id),
+            'option_security_id': str(security_id),
+            'used_ltp': float(used_ltp or entry_price),
+            'ltp_source': str(used_ltp_source),
             'created_at': datetime.now(timezone.utc).isoformat(),
         })
 
@@ -1417,7 +1554,34 @@ class TradingBot:
         index_name = config['selected_index']
         interval = format_timeframe(config['candle_interval'])
         indicator_name = config.get('indicator_type', 'supertrend')
-        logger.info(f"[BOT] Started - Index: {index_name}, Timeframe: {interval}, Indicator: {indicator_name}, Mode: {bot_state['mode']}")
+        # If portfolio mode is enabled, summarize per-strategy modes (live/paper)
+        portfolio_summary = ""
+        try:
+            if bool(config.get('portfolio_enabled')):
+                instances = config.get('portfolio_instances') or {}
+                live = 0
+                paper = 0
+                for v in instances.values():
+                    try:
+                        m = str(v.get('mode') or 'paper').strip().lower()
+                    except Exception:
+                        m = 'paper'
+                    if m == 'live':
+                        live += 1
+                    else:
+                        paper += 1
+                if live == 0 and paper == 0:
+                    portfolio_summary = " (portfolio: no instances)"
+                elif live > 0 and paper > 0:
+                    portfolio_summary = f" (portfolio: mixed live={live} paper={paper})"
+                elif live > 0:
+                    portfolio_summary = f" (portfolio: live={live})"
+                else:
+                    portfolio_summary = f" (portfolio: paper={paper})"
+        except Exception:
+            portfolio_summary = ""
+
+        logger.info(f"[BOT] Started - Index: {index_name}, Timeframe: {interval}, Indicator: {indicator_name}, Mode: {bot_state['mode']}" + portfolio_summary)
         
         return {"status": "success", "message": f"Bot started for {index_name} ({interval})"}
     
@@ -2883,6 +3047,8 @@ class TradingBot:
             expiry = expiry_date.strftime("%Y-%m-%d")
         
         entry_price = 0
+        used_ltp = 0.0
+        used_ltp_source = 'simulated'
         security_id = ""
         
         # Paper mode
@@ -2908,10 +3074,13 @@ class TradingBot:
                                 option_type=option_type,
                                 expiry=expiry,
                                 index_name=index_name,
+                                force_refresh=True,
                             )
                             if option_ltp and float(option_ltp) > 0:
                                 entry_price = round(float(option_ltp) / 0.05) * 0.05
                                 entry_price = round(float(entry_price), 2)
+                                used_ltp = float(entry_price)
+                                used_ltp_source = 'dhan_paper_live'
                                 used_live_quote = True
                     except Exception as e:
                         logger.debug(f"[ENTRY] PAPER live-quote failed: {e}")
@@ -2951,16 +3120,20 @@ class TradingBot:
                     logger.error(f"[ERROR] Could not find security ID for {index_name} {strike} {option_type}")
                     return
 
-                option_ltp = await self.dhan.get_option_ltp(
+                option_ltp = await self._fetch_option_ltp_retry(
                     security_id=security_id,
                     strike=strike,
                     option_type=option_type,
                     expiry=expiry,
-                    index_name=index_name
+                    index_name=index_name,
+                    retries=3,
+                    delay=0.15,
                 )
                 if option_ltp > 0:
                     entry_price = round(option_ltp / 0.05) * 0.05
                     entry_price = round(entry_price, 2)
+                    used_ltp = float(entry_price)
+                    used_ltp_source = 'dhan_retry'
             except Exception as e:
                 logger.error("[ERROR] Failed to get entry price: %s", e)
                 return
@@ -2995,6 +3168,8 @@ class TradingBot:
             if avg_price > 0:
                 entry_price = round(avg_price / 0.05) * 0.05
                 entry_price = round(entry_price, 2)
+                used_ltp = float(entry_price)
+                used_ltp_source = 'dhan_filled'
             
             logger.info(
                 f"[ENTRY] LIVE | {index_name} {option_type} {strike} | Expiry: {expiry} | OrderID: {order_id} | Fill Price: {entry_price} | Qty: {qty}"
@@ -3040,6 +3215,9 @@ class TradingBot:
             'qty': qty,
             'mode': bot_state['mode'],
             'index_name': index_name,
+            'option_security_id': str(security_id),
+            'used_ltp': float(used_ltp or self.entry_price),
+            'ltp_source': str(used_ltp_source),
             'created_at': datetime.now(timezone.utc).isoformat()
         }))
 

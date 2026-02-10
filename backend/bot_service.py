@@ -185,9 +185,28 @@ def get_bot_status() -> dict:
     
     logger.debug(f"[STATUS] Market check: Weekday={is_weekday}, Time={ist.strftime('%H:%M')}, Open={market_is_open}")
     
+    # Provide portfolio-aware status: include whether portfolio mode is enabled and per-strategy modes summary
+    portfolio_enabled = bool(config.get('portfolio_enabled'))
+    portfolio_instances = config.get('portfolio_instances') or {}
+    modes_summary = {"live": 0, "paper": 0}
+    try:
+        for v in (portfolio_instances or {}).values():
+            try:
+                m = str(v.get('mode') or 'paper').strip().lower()
+            except Exception:
+                m = 'paper'
+            if m == 'live':
+                modes_summary['live'] += 1
+            else:
+                modes_summary['paper'] += 1
+    except Exception:
+        modes_summary = {"live": 0, "paper": 0}
+
     return {
         "is_running": bot_state['is_running'],
         "mode": bot_state['mode'],
+        "portfolio_enabled": portfolio_enabled,
+        "portfolio_modes": modes_summary,
         "market_status": "open" if market_is_open else "closed",
         "market_details": {
             "is_weekday": is_weekday,
@@ -200,6 +219,7 @@ def get_bot_status() -> dict:
         "selected_index": config['selected_index'],
         "candle_interval": config['candle_interval']
     }
+    
 
 
 
